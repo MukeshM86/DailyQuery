@@ -7,6 +7,7 @@ SELECT GETDATE() AS runtime,
 FROM sys.dm_db_file_space_usage;
 go
 
+-- use below code for job
 SELECT
 t1.session_id, 
 (t1.internal_objects_alloc_page_count + task_alloc) as allocated, 
