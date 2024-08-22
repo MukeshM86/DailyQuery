@@ -1,0 +1,29 @@
+SELECT GETDATE() AS runtime,
+    SUM(user_object_reserved_page_count) * 8 AS usr_obj_kb,
+    SUM(internal_object_reserved_page_count) * 8 AS internal_obj_kb,
+    SUM(version_store_reserved_page_count) * 8 AS version_store_kb,
+    SUM(unallocated_extent_page_count) * 8 AS freespace_kb,
+    SUM(mixed_extent_page_count) * 8 AS mixedextent_kb
+FROM sys.dm_db_file_space_usage;
+go
+
+SELECT
+t1.session_id, 
+(t1.internal_objects_alloc_page_count + task_alloc) as allocated, 
+(t1.internal_objects_dealloc_page_count + task_dealloc) as deallocated,
+qt.text as [Batch Text],
+qp.query_plan as [Execution Plan]
+FROM sys.dm_db_session_space_usage as t1,
+    (select session_id, 
+        sum(internal_objects_alloc_page_count) as task_alloc,
+        sum (internal_objects_dealloc_page_count) as task_dealloc
+        FROM sys.dm_db_task_space_usage group by session_id) as t2,
+    sys.dm_exec_requests t3 
+        cross apply sys.dm_exec_sql_text (t3.sql_handle) as qt
+        cross apply sys.dm_exec_query_plan (t3.plan_handle) as qp
+WHERE t1.session_id = t2.session_id
+AND t1.session_id >50
+AND t1.database_id = DB_ID('tempdb')
+AND t1.session_id = t3.session_id
+ORDER BY allocated DESC;
+
