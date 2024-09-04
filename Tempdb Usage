@@ -20,7 +20,13 @@ FROM sys.dm_db_session_space_usage as t1,
         sum (internal_objects_dealloc_page_count) as task_dealloc
         FROM sys.dm_db_task_space_usage group by session_id) as t2,
     sys.dm_exec_requests t3 
-
+        cross apply sys.dm_exec_sql_text (t3.sql_handle) as qt
+        cross apply sys.dm_exec_query_plan (t3.plan_handle) as qp
+WHERE t1.session_id = t2.session_id
+AND t1.session_id >50
+AND t1.database_id = DB_ID('tempdb')
+AND t1.session_id = t3.session_id
+ORDER BY allocated DESC;
 go
 --https://www.madeiradata.com/post/troubleshooting-tempdb-space-usage#:~:text=If%20there%20is%20a%20currently,SessionId%20%2C%20RequestId%20%3D%20TasksSpaceUsage.
 SELECT
@@ -80,11 +86,4 @@ OUTER APPLY
 ORDER BY
 	SessionId	ASC ,
 	RequestId	ASC; 
-        cross apply sys.dm_exec_sql_text (t3.sql_handle) as qt
-        cross apply sys.dm_exec_query_plan (t3.plan_handle) as qp
-WHERE t1.session_id = t2.session_id
-AND t1.session_id >50
-AND t1.database_id = DB_ID('tempdb')
-AND t1.session_id = t3.session_id
-ORDER BY allocated DESC;
 
