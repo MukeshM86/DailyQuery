@@ -87,3 +87,99 @@ ORDER BY
 	SessionId	ASC ,
 	RequestId	ASC; 
 
+--------
+
+--Even we can use below code in job to monitor - V
+SELECT [Source] = 'dm_db_task_space_usage', 
+    [session_id] = SU.session_id, [request_id] = SU.request_id, 
+    [internal_objects_alloc_page_count_MB] = SU.internal_objects_alloc_page_count * 8 / 1024.0, 
+    [user_objects_alloc_page_count_MB] = SU.user_objects_alloc_page_count * 8 / 1024.0, 
+    [database_id] = S.database_id, 
+    [database_name] = D.name, 
+    [query_text] = SUBSTRING(T.text, R.statement_start_offset/2 + 1, (CASE WHEN R.statement_end_offset = -1 THEN LEN(CONVERT(nvarchar(max),T.text)) * 2 ELSE R.statement_end_offset END - R.statement_start_offset)/2),
+    [query_plan_current] = P1.query_plan, 
+    [query_plan_previous] = P2.query_plan, 
+    [query_plan_handle] = P1.plan_handle, 
+    [open_transactions] = S.open_transaction_count, 
+    [login_name] = S.login_name, 
+    [program_name] = S.program_name, 
+    [host_name] = S.host_name, 
+    [start_time] = R.start_time, 
+    [status] = R.status
+	--into tempdb_monitoring -- table name
+FROM sys.dm_db_task_space_usage SU
+INNER JOIN sys.dm_exec_requests R ON (SU.session_id = R.session_id AND SU.request_id = R.request_id)
+INNER JOIN sys.dm_exec_sessions S ON R.session_id = S.session_id 
+LEFT JOIN sys.databases D ON S.database_id = D.database_id
+CROSS APPLY sys.dm_exec_sql_text(R.sql_handle) T
+OUTER APPLY sys.dm_exec_query_statistics_xml(SU.session_id) AS P1 
+OUTER APPLY sys.dm_exec_query_plan_stats(P1.plan_handle) AS P2 
+WHERE SU.internal_objects_alloc_page_count + SU.user_objects_alloc_page_count > 0
+ORDER BY [user_objects_alloc_page_count_MB] desc, session_id, R.request_id;
+
+--https://techcommunity.microsoft.com/blog/azuredbsupport/resolve-tempdb-related-errors-in-azure-sql-database/3597944
+
+
+----- check this one too working for azure
+
+-- Sessions with open transactions in tempdb
+SELECT [Source] = 'database_transactions', 
+    [session_id] = ST.session_id, 
+    [transaction_id] = ST.transaction_id, 
+    [login_name] = S.login_name, 
+    [database_id] = S.database_id, 
+    [program_name] = S.program_name, 
+    [host_name] = S.host_name, 
+    [database_id] = DT.database_id, 
+    [database_name] = CASE
+        WHEN D.name IS NULL AND DT.database_id = 2 THEN 'TEMPDB'
+        ELSE D.name
+       END, 
+    [log_reuse_wait_desc] = D.log_reuse_wait_desc, 
+    [database_transaction_log_used_Kb] = CONVERT(numeric(18,2), DT.database_transaction_log_bytes_used / 1024.0 ), 
+    [database_transaction_begin_time] = DT.database_transaction_begin_time, 
+    [transaction_type_desc] = CASE DT.database_transaction_type
+        WHEN 1 THEN 'Read/write transaction'
+        WHEN 2 THEN 'Read-only transaction'
+        WHEN 3 THEN 'System transaction'
+        WHEN 4 THEN 'Distributed transaction'
+      END, 
+    [transaction_state_desc] = CASE DT.database_transaction_state
+        WHEN 1 THEN 'The transaction has not been initialized.'
+        WHEN 2 THEN 'The transaction is active'
+        WHEN 3 THEN 'The transaction has been initialized but has not generated any log records.'
+        WHEN 4 THEN 'The transaction has generated log records.'
+        WHEN 5 THEN 'The transaction has been prepared.'
+        WHEN 10 THEN 'The transaction has been committed.'
+        WHEN 11 THEN 'The transaction has been rolled back.'
+        WHEN 12 THEN 'The transaction is being committed. (The log record is being generated, but has not been materialized or persisted.)'
+      END,
+    [active_transaction_type_desc] = CASE AT.transaction_type
+        WHEN 1 THEN 'Read/write transaction'
+        WHEN 2 THEN 'Read-only transaction'
+        WHEN 3 THEN 'System transaction'
+        WHEN 4 THEN 'Distributed transaction'
+      END, 
+    [active_transaction_state_desc] = CASE AT.transaction_state
+        WHEN 0 THEN 'The transaction has not been completely initialized yet.'
+        WHEN 1 THEN 'The transaction has been initialized but has not started.'
+        WHEN 2 THEN 'The transaction is active'
+        WHEN 3 THEN 'The transaction has ended. This is used for read-only transactions.'
+        WHEN 4 THEN 'The commit process has been initiated on the distributed transaction.'
+        WHEN 5 THEN 'The transaction is in a prepared state and waiting resolution.'
+        WHEN 6 THEN 'The transaction has been committed.'
+        WHEN 7 THEN 'The transaction is being rolled back.'
+        WHEN 8 THEN 'The transaction has been rolled back.'
+      END
+FROM sys.dm_tran_database_transactions DT
+INNER JOIN sys.dm_tran_session_transactions ST ON DT.transaction_id = ST.transaction_id
+INNER JOIN sys.dm_tran_active_transactions AT ON DT.transaction_id = AT.transaction_id
+INNER JOIN sys.dm_exec_sessions S ON ST.session_id = S.session_id
+LEFT JOIN sys.databases D ON DT.database_id = D.database_id
+WHERE DT.database_id = 2 -- tempdb
+ORDER BY ST.session_id, DT.database_id;
+
+---- check below link for reference
+https://techcommunity.microsoft.com/blog/azuredbsupport/azure-sql-db-and-tempdb-usage-tracking/1573220
+
+
