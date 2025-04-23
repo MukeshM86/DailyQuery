@@ -71,3 +71,7 @@ FROM sys.dm_exec_sessions AS s
     INNER JOIN sys.dm_os_workers AS w
         ON t.worker_address = w.worker_address
 WHERE s.is_user_process = 0;
+
+cpu bound queries
+
+https://www.techdevops.com/Article.aspx?CID=322
