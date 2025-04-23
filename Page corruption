@@ -1,0 +1,10 @@
+Attempt to fetch logical page (1:174951532) in database 8 failed. It belongs to allocation unit 72057600021495808 not to 72057599048351744.
+
+
+SELECT au.allocation_unit_id, OBJECT_NAME(p.object_id) AS table_name, fg.name AS filegroup_name,  
+au.type_desc AS allocation_type, au.data_pages, partition_number  
+FROM sys.allocation_units AS au  
+JOIN sys.partitions AS p ON au.container_id = p.partition_id  
+JOIN sys.filegroups AS fg ON fg.data_space_id = au.data_space_id  
+WHERE au.allocation_unit_id = '72057600021495808' OR au.allocation_unit_id = '72057599048351744'  
+ORDER BY au.allocation_unit_id;  
