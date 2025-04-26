@@ -1,0 +1,137 @@
+Replication from youtube
+
+Snapshot replication
+Transaction replication
+Merge replication
+Peer to Peer replication
+
+
+Snapshot replication : Create bcp files from source and put in destination server at certain time period. Useful for small applications. Any changes in source after snapshot ceation will not be copied to destination.
+
+Snapshot agent reads the data from source and put in a snapshot folder using BCP
+
+Transaction replication : It is unidirectional oneway , it replicate the transaction from source to destination after snaphot is created. whatever changes happen to transaction replication tables are copied to destination server.
+
+sendig changes From source to destination.
+
+Source is publisher and destination is subscriber. Publisher is the one who sents the data and subscriber the one receives the data.
+Publisher will publish the data through publication. create subscription is subscriber.
+Publication will have articles and it publish the data and subscriber subscribe to articles.
+Articles are nothing but tables, procedure and views
+
+When setup a transaction replication, it creates "Log reader agent" (LRA) process. LRA it will read the changes in publication and write into distribution database(like queue database).
+It also create another process "distribution agent". It reads the data from distribution database and apply in target database.
+"Log reader agent" (LRA) process will be in distributed database only.
+
+We can put distribution database in below ways.
+1. Distribution database in different server and publisher and subscriber(distribution agent here) in differnent servers -> Pull subscription
+2. Distribution and publisher in same server and subscriber in differnent server(distribution agent here) -> Pull subscription
+3. Distribution and publisher in same server(distribution agent here) and subscriber in differnent server -> Push subscription
+
+If distribution agent is subscriber server then it is "PULL" and if distribution agent is in distributor server then it is "PUSH" subscription.
+
+Log reader agent reads the data from ldf file using sp_replcommand from source the server and write into distribution database.
+if you want to browse the commands whatever writing using sp_replbrowsecommand
+
+In distribution we will have 2 tables to write data from sp_replcommand.
+1. msrepl_commands
+2. msrepl_transaction
+
+distributor agent will reads data from these tables and write into subscriber target database.
+
+Snapshot agent will do BCP files in snapshot folder and this folder will be in distribution database servers(either differnt server or same source server)
+distributor agent will read BCP files and write into target server
+
+Configution
+1. Go to distribution database server and configure the distribution database
+2. Create publication -> do it in publication server/source
+3. Create subscription => do it in subscriber server/destination
+
+We can filter table columns while adding tables, thats called column level filtering.
+Article property > Whether you want to replicate all index, foreign key, primary key and all... We can setup table in target with different name as well, different schema... Statement Delivery 
+Filter table rows -> all the rows from table or filter few rows from table
+Snapshot agent -> either through BCP through snapshot agent or backup, restore
+
+note : In publication script we have option initialize from backup
+
+If snapshot not created then check Publication property -> subscription option -> snapshot always available -> true
+
+while create subscription @update_mode = 'read only' since transaction replication is one way, @sync_type = automatic or from backup
+
+Scripts to check
+
+--To view replication commands in the queue to get replicated - Distribution database
+
+select * from MSrepl_commands
+select * from MSrepl_transactions
+select * from MSrepl_errors
+
+exec distriution..sp_browsereplcmds --> SP will browser the commands from MSrepl_commands table. commands are will be in hexa decimal
+
+
+-- Troubleshoot Replication
+
+If replication is not working then we need to check publication database is working fine like online, ldf file have enough space.
+If it is good then log reader agent not able to read from publication and write into distribution database.
+If not check distribution agent able to read from distribution or unable to write into subscriber database. Problem will be anywhere.
+
+check max count of problematic table
+select max(column) from table ; --> check this in publication and subscriber database.
+
+check in GUI, publication to distributor  and distributor to subscriber tabs. If any errors means it will give in hexa decimal values. alternatively we can check those errors in MSrepl_errors table as well.
+
+Get xact_seqno and command_id from MSrepl_errors table and pass into below query
+
+-- to view the specific command in detail -- distribution database
+select * from msrepl_commands
+where xact_seqno = 
+and command_id = 
+
+from the above query we can get xact_seqno (hexa decimal), command id, publisher database id, article id, etc.. use those info in below query
+exec sp_browsereplcmds
+@xact_seqno_start = 
+@xact_seqno_end=
+@publisher_database_id =
+@article_id=
+@command_id = 
+
+From above we can find command what is trying to execute. We need to take decision that either we need to drop that command from distribution table or fix the error in pub/sub database.
+
+delete from msrepl_commands where xact_no = and command_id = 1
+
+Note : if we have multiple subscriber then delete in msrepl_commands is not a good idea.. Plan for something.. 
+
+Another way is that, add below command in distribution agent job, it will dump the errors in txt file with readable format.
+
+-output verboselevel 2 -output g:\sql\replout.txt
+
+-- To find last successfull transaction in subscriber is
+select * from msreplication_subscriptions
+
+-- To skip any errors in replication we can follow below
+Find the error number from replication monitor 
+
+distribution -> replication monitor -> agent profile -> default agent profile -> -Skiperrors  => this is default profile and doesnot omit any error... So,
+distribution -> replication monitor -> agent profile -> New -> based on default agent profile -> choose our profile -> Ok
+
+Links to refer for future
+https://sqlship.wordpress.com/category/sql-server-replication/
+
+How to setup a transaction replication from backup
+
+-- Go to publication server, do everything using GUI (dont select snapshot option) and make a script instead of create. In script change below option.
+
+exec sp_addpublication .. @allow_initialize_from_backup = 'true' -- default it is false and run the script.. GUI also available
+
+--backup and restore the database from publication to sunscriber
+
+-- goto subscription server create new subscription -> dont select initialize and take script instead of GUI
+exec sp_addsubscription ..@sync_type = 'initialize with backup', @backupdevicetype = 'disk', @backupdevicename = 'c:\sd.bak'
+
+
+
+
+
+
+
+
