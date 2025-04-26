@@ -1,0 +1,76 @@
+Microsoft SQL Server High Availability: Always On Availability Groups VS Failover Cluster Instances
+
+Always On Failover Cluster Instances 
+======================
+3 nodes 
+
+VMWare tools -> how to check whether installed - > VM-> reinstall vmware tool greyed
+
+to install DC
+open server manager -> manage -> server role -> role base -> install/select actie directory domain services select -> DNS select-> file and storage services -> expan  file iscsi server > select iscsi taget server -> select failover cluster manager -> install
+
+to change server name , IE security configuration
+server manager -> local server -> workgroup -> change -> modify server name -> restart later
+server manager -> local server -> IE enhanced security configuration -> click on -> select OFF on both -> OK
+
+disable firewall, enable ports
+In search -> search windwos defender firewall -> windows defenter firewall and advance secuurity -> turn windows defender firewarewall on or off -> select turn off on both private and public -> ok
+
+Enable ports
+In search -> search firewall -> windows defenter firewall and advance secuurity -> advanced settings -> inbound rules -> right click new rules ->port -> specific ports -> enter 1433, 1434, 5022, 3343 -> name -> SQL ports -> finish
+In search -> search firewall -> windows defenter firewall and advance secuurity -> advanced settings -> outbound rules -> right click new rules ->port -> specific ports -> enter 1433, 1434, 5022, 3343 -> select allow the connection -> name -> SQL ports -> finish
+
+Network
+
+for static IP we are doing this -> VMWare worktation -> select server -> property -> select network adapator ->add ->  select network adapator -> finish -> ok
+
+restart the server
+
+open network manager -> you can see 2 network -> property -> networking -> internet protocol ip4 -> use following IP(eg case 192.168.174.129), default gateway(eg case 192.168.174.2) -> cmd ipconfig -> copy paste same ip from ethernet1 and for DNS  using 127.0.0.1 -> OK
+
+restart the vm
+
+
+NODE1 and NODE2
+go to vmware property/setting -> click on add -> select network adaptor -> finish -> ok
+network adapator -> ethernet -> adaptor settings -> ethernet1 -> property -> networking -> internet protocol ip4 -> use following IP(eg case 192.168.174.129) next ip of DC (130)-> same defult gateway like DC , preferred DNS ip address of DC (eg case 192.168.174.129) -> ok
+
+go to vmware property/setting -> click on add -> select network adaptor -> finish -> ok
+network adapator -> ethernet -> adaptor settings -> ethernet1 -> property -> networking -> internet protocol ip4 -> use following IP(eg case 192.168.174.129) next ip of DC (131) -> same defult gateway like DC , preferred DNS ip address of DC (eg case 192.168.174.129) -> ok
+--
+to install .net and cluster manager
+open server manager -> manage -> features -> .net framework 3.5 and 4.7, failover cluster manager -> next -> finish
+
+to change server name , IE security configuration
+disable firewall, enable ports
+Enable ports
+----
+Next promopt DC server as domain controller
+
+server manger -> near manager -> prompt this server as DC -> add new forest -> mukeshdba.com -> next -> password -> netbios domain shows as mukeshdba -> install
+ restart
+
+after this server will be in domain
+---
+Add NODE1 and NODE2 to domain
+
+open server manger -> local server -> click on workgroup -> change -> domain give mukeshdba.com -> OK
+
+===========================
+in cmd
+
+slmgr /rearm
+
+restart  and license will be validate for 180
+===
+
+slmgr /xpr ---> extend 10 days
+
+slmagr -rearm --> 180 days
+
+slmgr /dlv --> check how rearm are there, total we can do 5 times
+
+
+
+
+
