@@ -1,0 +1,36 @@
+declare @cpufactor int
+declare @iofactor int
+declare @durationfactor int
+
+/* parameter sniffing will usually lead to large CPU, IO and Duration increases.
+
+checking duration only might fail to distinguish it from blocking problems*/
+set @cpufactor=100 /* 0 disables*/
+set @iofactor=100 /* 0 disables*/
+set @durationfactor = 100 /* 0 disables*/
+
+select
+SUBSTRING(ST.text, (QS.statement_start_offset/2) + 1,
+((CASE statement_end_offset
+WHEN -1 THEN DATALENGTH(ST.text)
+ELSE QS.statement_end_offset END
+- QS.statement_start_offset)/2) + 1) AS statement_text ,
+ST.text as 'full batch',
+query_hash,
+query_plan_hash,
+
+*
+
+from sys.dm_exec_query_stats AS QS
+CROSS APPLY sys.dm_exec_sql_text(QS.sql_handle) as ST
+where
+
+/*'strictly smaller than' will rule out any 0 values from resultset*/
+
+@cpufactor * min_worker_time < max_worker_time
+and
+@iofactor * min_logical_reads < max_logical_reads
+and
+@durationfactor * min_elapsed_time < max_elapsed_time
+
+--https://techcommunity.microsoft.com/blog/sqlserversupport/detecting-possible-parameter-sniffing-occurences-with-dmv/318829
