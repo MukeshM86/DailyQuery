@@ -1,0 +1,101 @@
+SELECT sp.stats_id, name, filter_definition, last_updated, rows, rows_sampled, steps, unfiltered_rows, modification_counter   
+FROM sys.stats AS stat   
+CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp  
+--WHERE stat.object_id = object_id('TEST'); 
+
+SELECT obj.name, obj.object_id, stat.name, stat.stats_id, last_updated, modification_counter  
+FROM sys.objects AS obj   
+INNER JOIN sys.stats AS stat ON stat.object_id = obj.object_id  
+CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp  
+WHERE modification_counter > 1000; 
+
+SELECT obj.name [table name], obj.object_id,sp.stats_id, stat.name, filter_definition, last_updated, rows, rows_sampled, steps, unfiltered_rows, modification_counter   
+FROM sys.objects AS obj   
+INNER JOIN sys.stats AS stat ON stat.object_id = obj.object_id  
+
+CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp  
+WHERE stat.object_id = object_id('sales.SalesOrderDetailEnlarged')
+
+SELECT
+    sm.[name] AS [schema_name],
+    tb.[name] AS [table_name],
+    co.[name] AS [stats_column_name],
+    st.[name] AS [stats_name],
+    STATS_DATE(st.[object_id],st.[stats_id]) AS [stats_last_updated_date]
+FROM
+    sys.objects ob
+    JOIN sys.stats st
+        ON  ob.[object_id] = st.[object_id]
+    JOIN sys.stats_columns sc
+        ON  st.[stats_id] = sc.[stats_id]
+        AND st.[object_id] = sc.[object_id]
+    JOIN sys.columns co
+        ON  sc.[column_id] = co.[column_id]
+        AND sc.[object_id] = co.[object_id]
+    JOIN sys.types  ty
+        ON  co.[user_type_id] = ty.[user_type_id]
+    JOIN sys.tables tb
+        ON  co.[object_id] = tb.[object_id]
+    JOIN sys.schemas sm
+        ON  tb.[schema_id] = sm.[schema_id]
+WHERE
+    --st.[user_created] = 1 and 
+	st.object_id = object_id('sales.SalesOrderDetailEnlarged')
+
+SELECT      t.[name]                        AS [table_name]
+,           s.[name]                        AS [table_schema_name]
+,           c.[name]                        AS [column_name]
+,           c.[column_id]                   AS [column_id]
+,           t.[object_id]                   AS [object_id]
+,           ROW_NUMBER()
+            OVER(ORDER BY (SELECT NULL))    AS [seq_nmbr]
+FROM        sys.[tables] t
+JOIN        sys.[schemas] s         ON  t.[schema_id]       = s.[schema_id]
+JOIN        sys.[columns] c         ON  t.[object_id]       = c.[object_id]
+LEFT JOIN   sys.[stats_columns] l   ON  l.[object_id]       = c.[object_id]
+                                    AND l.[column_id]       = c.[column_id]
+                                    AND l.[stats_column_id] = 1
+LEFT JOIN    sys.[external_tables] e    ON    e.[object_id]        = t.[object_id]
+WHERE       --l.[object_id] IS NULL --only columns which are not involved in stats or not the leading col in a stats obj
+--AND            e.[object_id] IS NULL -- not an external table
+ e.object_id = object_id('sales.SalesOrderDetailEnlarged')
+
+/*SELECT sp.stats_id, 
+       name, 
+       filter_definition, 
+       last_updated, 
+       rows, 
+       rows_sampled, 
+       steps, 
+       unfiltered_rows, 
+       modification_counter
+FROM sys.stats AS stat
+     CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp
+WHERE stat.object_id = OBJECT_ID('sales.SalesOrderDetailEnlarged');*/
+
+SELECT DISTINCT
+OBJECT_NAME(s.[object_id]) AS TableName,
+c.name AS ColumnName,
+s.name AS StatName,
+s.auto_created,
+s.user_created,
+s.no_recompute,
+s.[object_id],
+s.stats_id,
+sc.stats_column_id,
+sc.column_id,
+STATS_DATE(s.[object_id], s.stats_id) AS LastUpdated
+FROM sys.stats s JOIN sys.stats_columns sc 
+              ON sc.[object_id] = s.[object_id] AND sc.stats_id = s.stats_id
+JOIN sys.columns c ON c.[object_id] = sc.[object_id] AND c.column_id = sc.column_id
+JOIN sys.partitions par ON par.[object_id] = s.[object_id]
+JOIN sys.objects obj ON par.[object_id] = obj.[object_id]
+WHERE 
+--OBJECTPROPERTY(s.OBJECT_ID,'IsUserTable') = 1
+--AND (s.auto_created = 1 OR s.user_created = 1);
+ s.object_id = OBJECT_ID('sales.SalesOrderDetailEnlarged');
+
+
+
+
+https://medium.com/@kwtrelbakouri1/sql-server-statistics-0864ef0b9811
