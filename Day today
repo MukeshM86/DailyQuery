@@ -1,0 +1,476 @@
+--Check what is using tempdb.txt
+SELECT GETDATE() AS runtime,
+    SUM(user_object_reserved_page_count) * 8 AS usr_obj_kb,
+    SUM(internal_object_reserved_page_count) * 8 AS internal_obj_kb,
+    SUM(version_store_reserved_page_count) * 8 AS version_store_kb,
+    SUM(unallocated_extent_page_count) * 8 AS freespace_kb,
+    SUM(mixed_extent_page_count) * 8 AS mixedextent_kb
+FROM sys.dm_db_file_space_usage;
+go
+;WITH task_space_usage AS (
+    -- SUM alloc/delloc pages
+    SELECT session_id,
+           request_id,
+           SUM(internal_objects_alloc_page_count) AS alloc_pages,
+           SUM(internal_objects_dealloc_page_count) AS dealloc_pages
+    FROM sys.dm_db_task_space_usage WITH (NOLOCK)
+    WHERE session_id <> @@SPID
+    GROUP BY session_id, request_id
+)
+SELECT TSU.session_id,
+       TSU.alloc_pages * 1.0 / 128 AS [internal object MB space],
+       TSU.dealloc_pages * 1.0 / 128 AS [internal object dealloc MB space],
+       EST.text,
+       -- Extract statement from sql text
+       ISNULL(
+           NULLIF(
+               SUBSTRING(
+                   EST.text, 
+                   ERQ.statement_start_offset / 2, 
+                   CASE WHEN ERQ.statement_end_offset < ERQ.statement_start_offset THEN 0 ELSE( ERQ.statement_end_offset - ERQ.statement_start_offset ) / 2 END
+               ), ''
+           ), EST.text
+       ) AS [statement text],
+       EQP.query_plan
+FROM task_space_usage AS TSU
+INNER JOIN sys.dm_exec_requests ERQ WITH (NOLOCK)
+    ON  TSU.session_id = ERQ.session_id
+    AND TSU.request_id = ERQ.request_id
+OUTER APPLY sys.dm_exec_sql_text(ERQ.sql_handle) AS EST
+OUTER APPLY sys.dm_exec_query_plan(ERQ.plan_handle) AS EQP
+WHERE EST.text IS NOT NULL OR EQP.query_plan IS NOT NULL
+ORDER BY 3 DESC, 5 DESC
+
+--Day today activity Queries.txt
+-- SQL and OS Version information for current instance  (Query 1) (Version Info)
+SELECT @@SERVERNAME AS [Server Name], @@VERSION AS [SQL Server and OS Version Info];
+
+-- Good basic information about OS memory amounts and state  (System Memory)
+SELECT total_physical_memory_kb/1024 AS [Physical Memory (MB)], 
+       available_physical_memory_kb/1024 AS [Available Memory (MB)], 
+       total_page_file_kb/1024 AS [Total Page File (MB)], 
+	   available_page_file_kb/1024 AS [Available Page File (MB)], 
+	   system_cache_kb/1024 AS [System Cache (MB)],
+       system_memory_state_desc AS [System Memory State]
+FROM sys.dm_os_sys_memory WITH (NOLOCK) OPTION (RECOMPILE);
+
+-- SQL Server Process Address space info  (Process Memory)
+SELECT physical_memory_in_use_kb/1024 AS [SQL Server Memory Usage (MB)],
+	   locked_page_allocations_kb/1024 AS [SQL Server Locked Pages Allocation (MB)],
+       large_page_allocations_kb/1024 AS [SQL Server Large Pages Allocation (MB)], 
+	   page_fault_count, memory_utilization_percentage, available_commit_limit_kb, 
+	   process_physical_memory_low, process_virtual_memory_low
+FROM sys.dm_os_process_memory WITH (NOLOCK) OPTION (RECOMPILE);
+
+-- Get total buffer usage by database for current instance  (Total Buffer Usage by Database)
+-- This make take some time to run on a busy instance
+WITH AggregateBufferPoolUsage
+AS
+(SELECT DB_NAME(database_id) AS [Database Name],
+CAST(COUNT(*) * 8/1024.0 AS DECIMAL (10,2))  AS [CachedSize]
+FROM sys.dm_os_buffer_descriptors WITH (NOLOCK)
+WHERE database_id <> 32767 -- ResourceDB
+GROUP BY DB_NAME(database_id))
+SELECT ROW_NUMBER() OVER(ORDER BY CachedSize DESC) AS [Buffer Pool Rank], 
+       [Database Name], CachedSize AS [Cached Size (MB)],
+       CAST(CachedSize / SUM(CachedSize) OVER() * 100.0 AS DECIMAL(5,2)) AS [Buffer Pool Percent]
+FROM AggregateBufferPoolUsage
+ORDER BY [Buffer Pool Rank] OPTION (RECOMPILE);
+
+
+-- Page Life Expectancy (PLE) value for each NUMA node in current instance  (PLE by NUMA Node)
+SELECT @@SERVERNAME AS [Server Name], RTRIM([object_name]) AS [Object Name], 
+instance_name, cntr_value AS [Page Life Expectancy]
+FROM sys.dm_os_performance_counters WITH (NOLOCK)
+WHERE [object_name] LIKE N'%Buffer Node%' -- Handles named instances
+AND counter_name = N'Page life expectancy' OPTION (RECOMPILE);
+
+-- Memory Grants Pending value for current instance  (Memory Grants Pending)
+SELECT @@SERVERNAME AS [Server Name], RTRIM([object_name]) AS [Object Name], 
+cntr_value AS [Memory Grants Pending]                                                                                                      
+FROM sys.dm_os_performance_counters WITH (NOLOCK)
+WHERE [object_name] LIKE N'%Memory Manager%' -- Handles named instances
+AND counter_name = N'Memory Grants Pending' OPTION (RECOMPILE);
+
+-- Memory Clerk Usage for instance  (Query 6) (Memory Clerk Usage)
+SELECT TOP(10) mc.[type] AS [Memory Clerk Type], 
+       CAST((SUM(mc.pages_kb)/1024.0) AS DECIMAL (15,2)) AS [Memory Usage (MB)] 
+FROM sys.dm_os_memory_clerks AS mc WITH (NOLOCK)
+GROUP BY mc.[type]  
+ORDER BY SUM(mc.pages_kb) DESC OPTION (RECOMPILE);
+
+-- Find single-use, ad-hoc and prepared queries that are bloating the plan cache   (Ad hoc Queries)
+SELECT TOP(50) DB_NAME(t.[dbid]) AS [Database Name], t.[text] AS [Query Text], 
+cp.objtype AS [Object Type],   
+cp.size_in_bytes/1024 AS [Plan Size in KB]
+FROM sys.dm_exec_cached_plans AS cp WITH (NOLOCK)
+CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS t
+WHERE cp.cacheobjtype = N'Compiled Plan' 
+AND cp.objtype IN (N'Adhoc', N'Prepared') 
+AND cp.usecounts = 1
+ORDER BY cp.size_in_bytes DESC, DB_NAME(t.[dbid]) OPTION (RECOMPILE);
+
+--DB File size.txt
+use master
+go
+SELECT RTRIM(name) AS [Segment Name], groupid AS [Group Id], filename AS [File Name],
+   CAST(size/128.0 AS DECIMAL(10,2)) AS [Allocated Size in MB],
+   CAST(FILEPROPERTY(name, 'SpaceUsed')/128.0 AS DECIMAL(10,2)) AS [Space Used in MB],
+  -- CAST([maxsize]/128.0 AS DECIMAL(10,2)) AS [Max in MB],
+   CAST(size/128.0-(FILEPROPERTY(name, 'SpaceUsed')/128.0) AS DECIMAL(10,2)) AS [Available Space in MB],
+   CAST((CAST(FILEPROPERTY(name, 'SpaceUsed')/128.0 AS DECIMAL(10,2))/CAST(size/128.0 AS DECIMAL(10,2)))*100 AS DECIMAL(10,2)) AS [Percent Used],
+    @@SERVERNAME as [server name]
+FROM sysfiles
+ORDER BY [Percent Used] DESC
+go
+SELECT DISTINCT vs.volume_mount_point, vs.file_system_type,
+
+vs.logical_volume_name, CONVERT(DECIMAL(18,2),vs.total_bytes/1073741824.0) AS [Total Size (GB)],
+
+CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) AS [Free Space (GB)],
+CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS [Space Free %],
+CONVERT(DECIMAL(18,2),vs.total_bytes/1073741824.0) - CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) as [Used Space (GB)],
+100 - CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) as [Used Space %]
+FROM sys.master_files AS f WITH (NOLOCK)
+CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.[file_id]) AS vs
+ORDER BY vs.volume_mount_point OPTION (RECOMPILE);
+
+--Disk Latency.txt
+use master   
+
+SELECT   LEFT(mf.physical_name,100),   
+
+        ReadLatency = CASE WHEN num_of_reads = 0 THEN 0 ELSE (io_stall_read_ms / num_of_reads) END, 
+
+        WriteLatency = CASE WHEN num_of_writes = 0 THEN 0 ELSE (io_stall_write_ms / num_of_writes) END, 
+
+        AvgLatency =  CASE WHEN (num_of_reads = 0 AND num_of_writes = 0) THEN 0 
+
+                       ELSE (io_stall / (num_of_reads + num_of_writes)) END,
+
+        LatencyAssessment = CASE WHEN (num_of_reads = 0 AND num_of_writes = 0) THEN 'No data' ELSE 
+
+              CASE WHEN (io_stall / (num_of_reads + num_of_writes)) < 2 THEN 'Excellent' 
+
+                   WHEN (io_stall / (num_of_reads + num_of_writes)) BETWEEN 2 AND 5 THEN 'Very good' 
+
+                   WHEN (io_stall / (num_of_reads + num_of_writes)) BETWEEN 6 AND 15 THEN 'Good' 
+
+                   WHEN (io_stall / (num_of_reads + num_of_writes)) BETWEEN 16 AND 100 THEN 'Poor' 
+
+                   WHEN (io_stall / (num_of_reads + num_of_writes)) BETWEEN 100 AND 500 THEN  'Bad' 
+
+                   ELSE 'Deplorable' END  END, 
+
+        [Avg KBs/Transfer] =  CASE WHEN (num_of_reads = 0 AND num_of_writes = 0) THEN 0 
+
+                   ELSE ((([num_of_bytes_read] + [num_of_bytes_written]) / (num_of_reads + num_of_writes)) / 1024) END, 
+
+        LEFT (mf.physical_name, 2) AS Volume, 
+
+        LEFT(DB_NAME (vfs.database_id),32) AS [Database Name]
+
+      FROM sys.dm_io_virtual_file_stats (NULL,NULL) AS vfs  
+
+      JOIN sys.master_files AS mf ON vfs.database_id = mf.database_id 
+
+        AND vfs.file_id = mf.file_id 
+
+      ORDER BY AvgLatency DESC
+
+
+--Disk Space or Mount point space.txt
+SELECT DISTINCT vs.volume_mount_point, vs.file_system_type,
+
+vs.logical_volume_name, CONVERT(DECIMAL(18,2),vs.total_bytes/1073741824.0) AS [Total Size (GB)],
+
+CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) AS [Free Space (GB)],
+CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS [Space Free %],
+CONVERT(DECIMAL(18,2),vs.total_bytes/1073741824.0) - CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) as [Used Space (GB)],
+100 - CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) as [Used Space %]
+FROM sys.master_files AS f WITH (NOLOCK)
+CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.[file_id]) AS vs
+ORDER BY vs.volume_mount_point OPTION (RECOMPILE);
+
+go
+sELECT DISTINCT dovs.logical_volume_name AS LogicalName,
+file_system_type,
+dovs.volume_mount_point AS Drive,
+CONVERT(INT,dovs.total_bytes/1048576.0/1024.0) AS TotalSpaceInGB,
+CONVERT(INT,dovs.available_bytes/1048576.0/1024.0) AS FreeSpaceInGB,
+(dovs.available_bytes*1.000/dovs.total_bytes*1.000)*100 [Freespace%],
+CONVERT(INT,(dovs.total_bytes-dovs.available_bytes)/1048576.0/1024.0) as UsedSpaceInGB
+FROM sys.master_files mf
+CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.FILE_ID) dovs
+ORDER BY FreeSpaceInGB
+
+--Index details for a database.txt
+use static_tables
+go
+SELECT OBJECT_NAME(IX.OBJECT_ID) Table_Name
+	   ,IX.name AS Index_Name
+	   ,IX.type_desc Index_Type
+	   --,SUM(PS.[used_page_count]) * 8 IndexSizeKB
+	   ,IXUS.user_seeks AS [user Seeks]
+	   ,IXUS.user_scans AS [user Scans]
+	   ,IXUS.user_lookups AS [user Lookups]
+	   ,IXUS.user_updates AS [user Updates]
+	   ,IXUS.last_user_seek AS [Last User Seek]
+	   ,IXUS.last_user_scan AS [Last User Scan]
+	   ,IXUS.last_user_lookup AS [Last User Lookup]
+	   ,IXUS.last_user_update AS [Last User Update]
+FROM sys.indexes IX
+INNER JOIN sys.dm_db_index_usage_stats IXUS ON IXUS.index_id = IX.index_id AND IXUS.OBJECT_ID = IX.OBJECT_ID
+INNER JOIN sys.dm_db_partition_stats PS on PS.object_id=IX.object_id
+WHERE OBJECTPROPERTY(IX.OBJECT_ID,'IsUserTable') = 1
+GROUP BY OBJECT_NAME(IX.OBJECT_ID) ,IX.name ,IX.type_desc ,IXUS.user_seeks ,IXUS.user_scans ,IXUS.user_lookups,IXUS.user_updates ,IXUS.last_user_seek ,IXUS.last_user_scan ,IXUS.last_user_lookup ,IXUS.last_user_update
+go
+
+select i.[name] as index_name,*,
+    substring(column_names, 1, len(column_names)-1) as [columns],
+    case when i.[type] = 1 then 'Clustered index'
+        when i.[type] = 2 then 'Nonclustered unique index'
+        when i.[type] = 3 then 'XML index'
+        when i.[type] = 4 then 'Spatial index'
+        when i.[type] = 5 then 'Clustered columnstore index'
+        when i.[type] = 6 then 'Nonclustered columnstore index'
+        when i.[type] = 7 then 'Nonclustered hash index'
+        end as index_type,
+    case when i.is_unique = 1 then 'Unique'
+        else 'Not unique' end as [unique],
+    schema_name(t.schema_id) + '.' + t.[name] as table_view, 
+    case when t.[type] = 'U' then 'Table'
+        when t.[type] = 'V' then 'View'
+        end as [object_type]
+from sys.objects t
+    inner join sys.indexes i
+        on t.object_id = i.object_id
+    cross apply (select col.[name] + ', '
+                    from sys.index_columns ic
+                        inner join sys.columns col
+                            on ic.object_id = col.object_id
+                            and ic.column_id = col.column_id
+                    where ic.object_id = t.object_id
+                        and ic.index_id = i.index_id
+                            order by key_ordinal
+                            for xml path ('') ) D (column_names)
+where t.is_ms_shipped <> 1
+and index_id > 0
+order by i.[name]
+
+--Index recommendation based on query plan 
+--Get missing indexes from cache
+SELECT qs_cpu.total_worker_time/1000 AS total_cpu_time_ms, q.[text], p.query_plan, qs_cpu.execution_count, q.dbid, q.objectid, q.encrypted AS text_encrypted 
+FROM (SELECT TOP 500 qs.plan_handle, qs.total_worker_time, qs.execution_count 
+FROM sys.dm_exec_query_stats qs 
+ORDER BY qs.total_worker_time DESC) AS qs_cpu 
+CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS q CROSS APPLY sys.dm_exec_query_plan (plan_handle) p 
+--WHERE p.query_plan.exist('declare namespace qplan=http://schemas.microsoft.com/sqlserver/2004/07/showplan; //qplan:MissingIndexes')=1
+WHERE p.query_plan.exist('declare namespace 
+        qplan = "http://schemas.microsoft.com/sqlserver/2004/07/showplan";
+        //qplan:MissingIndexes')=1
+
+--Index_fragmentation.txt
+DECLARE @DatabaseID int
+
+SET @DatabaseID = DB_ID()
+
+SELECT DB_NAME(@DatabaseID) AS DatabaseName,
+       schemas.[name] AS SchemaName,
+       objects.[name] AS ObjectName,
+       indexes.[name] AS IndexName,
+       objects.type_desc AS ObjectType,
+       indexes.type_desc AS IndexType,
+       dm_db_index_physical_stats.partition_number AS PartitionNumber,
+       dm_db_index_physical_stats.page_count AS [PageCount],
+       dm_db_index_physical_stats.avg_fragmentation_in_percent AS AvgFragmentationInPercent
+FROM sys.dm_db_index_physical_stats (@DatabaseID, NULL, NULL, NULL, 'LIMITED') dm_db_index_physical_stats
+INNER JOIN sys.indexes indexes ON dm_db_index_physical_stats.[object_id] = indexes.[object_id] AND dm_db_index_physical_stats.index_id = indexes.index_id
+INNER JOIN sys.objects objects ON indexes.[object_id] = objects.[object_id]
+INNER JOIN sys.schemas schemas ON objects.[schema_id] = schemas.[schema_id]
+WHERE objects.[type] IN('U','V')
+AND objects.is_ms_shipped = 0
+AND indexes.[type] IN(1,2,3,4)
+AND indexes.is_disabled = 0
+AND indexes.is_hypothetical = 0
+AND dm_db_index_physical_stats.alloc_unit_type_desc = 'IN_ROW_DATA'
+AND dm_db_index_physical_stats.index_level = 0
+AND dm_db_index_physical_stats.page_count >= 1000
+
+--IO_stalls_by_DB_files.sql
+SELECT UPPER(SUBSTRING(b.physical_name, 1, 200)) AS disk_location, a.io_stall, a.io_stall_read_ms, a.io_stall_write_ms, a.num_of_reads, 
+a.num_of_writes, 
+--a.sample_ms, a.num_of_bytes_read, a.num_of_bytes_written, a.io_stall_write_ms, 
+( ( a.size_on_disk_bytes / 1024 ) / 1024.0 ) AS size_on_disk_mb, 
+db_name(a.database_id) AS dbname, 
+b.name, a.file_id, 
+db_file_type = CASE 
+                   WHEN a.file_id = 2 THEN 'Log' 
+                   ELSE 'Data' 
+                   END
+FROM sys.dm_io_virtual_file_stats (NULL, NULL) a 
+JOIN sys.master_files b ON a.file_id = b.file_id 
+AND a.database_id = b.database_id 
+ORDER BY a.io_stall DESC 
+
+select @@servername
+
+--resource semaphore.txt
+sp_whoisactive @get_plans=1
+
+go
+select * from sys.dm_exec_query_resource_semaphores
+select * from sys.dm_exec_query_memory_grants
+
+
+SELECT total_physical_memory_kb/1024 [Total Physical Memory in MB],
+available_physical_memory_kb/1024 [Physical Memory Available in MB],
+system_memory_state_desc
+FROM sys.dm_os_sys_memory;
+
+SELECT physical_memory_in_use_kb/1024 [Physical Memory Used in MB],
+process_physical_memory_low [Physical Memory Low],
+process_virtual_memory_low [Virtual Memory Low]
+FROM sys.dm_os_process_memory;
+
+SELECT committed_kb/1024 [SQL Server Committed Memory in MB],
+committed_target_kb/1024 [SQL Server Target Committed Memory in MB]
+FROM sys.dm_os_sys_info;
+
+
+
+--shrink Tempdb.txt
+USE [tempdb]
+GO
+DBCC FREEPROCCACHE
+GO
+DBCC SHRINKFILE (N'tempdev' , 2765)
+GO
+
+--
+/*
+CHECKPOINT;
+GO
+DBCC DROPCLEANBUFFERS;
+GO
+
+DBCC FREEPROCCACHE;
+GO
+DBCC FREESYSTEMCACHE ('ALL');
+GO
+
+DBCC FREESESSIONCACHE;
+GO
+
+DBCC SHRINKFILE (TEMPDEV, 20480);   --- New file size in MB
+GO
+*/
+
+--Blocking
+
+exec WDBS_Maint..sp_whoisactive @find_block_leaders=1, @sort_order = '[%session%] desc'
+exec WDBS_Maint..sp_whoisactive @output_column_list = '[dd%][session_id][sql_text][sql_command][login_name][block%][%]'
+
+--Statistics.txt
+check when statistics are update for a table
+
+SELECT sp.stats_id, 
+       name, 
+       filter_definition, 
+       last_updated, 
+       rows, 
+       rows_sampled, 
+       steps, 
+       unfiltered_rows, 
+       modification_counter
+FROM sys.stats AS stat
+     CROSS APPLY sys.dm_db_stats_properties(stat.object_id, stat.stats_id) AS sp
+WHERE stat.object_id = OBJECT_ID('HumanResources.Employee');
+
+--Update statistics by
+
+Update STATISTICS HumanResources.Employee -- Table
+
+Update STATISTICS HumanResources.Employee IX_Employee_OrganizationNode -- Update for index column/specific statistics
+
+Update STATISTICS HumanResources.Employee IX_Employee_OrganizationNode WITH FULLSCAN -- Full scan
+
+Update STATISTICS HumanResources.Employee IX_Employee_OrganizationNode WITH SAMPLE 100 PERCENT
+
+Update STATISTICS HumanResources.Employee IX_Employee_OrganizationNode WITH SAMPLE 10 PERCENT -- Sample %
+
+Update STATISTICS HumanResources.Employee IX_Employee_OrganizationNode WITH SAMPLE 1000 ROWS
+
+
+-- Update statistics for whole DB
+
+sp_updatestats
+
+sp_MSforeachdb 'use [?]; exec sp_updatestats' -- All databases
+
+------------ Using Ola Hal Script
+
+<?query --
+EXECUTE [dbo].[IndexOptimize] @Databases = 'ALL_DATABASES', @LogToTable = 'Y', @FragmentationLow = NULL, @FragmentationMedium = NULL, @FragmentationHigh = NULL, @UpdateStatistics = 'ALL', @OnlyModifiedStatistics = 'Y'
+--?>
+
+EXECUTE [dbo].[IndexOptimize]  @Databases = 'db',
+@Indexes = 'db.dbo.table',
+@LogToTable = 'Y', 
+@SortInTempdb='Y', 
+@UpdateStatistics = 'ALL', 
+@OnlyModifiedStatistics = 'Y'
+go
+-- Brent comment on statistics update
+EXECUTE [dbo].[IndexOptimize]
+    @Databases = 'USER_DATABASES' ,
+    @FragmentationLow = NULL ,
+    @FragmentationMedium = NULL ,
+    @FragmentationHigh = NULL ,
+    @UpdateStatistics = 'ALL' ,
+    @OnlyModifiedStatistics = N'Y' ,
+    @LogToTable = N'Y';
+
+--sql-server-statistics-modification-counter
+SET NOCOUNT ON;
+DECLARE @objectID INT = OBJECT_ID(@schemaName + '.' + @tableName);
+SELECT 
+	[rowmodcounter].[modPercent], 
+	names.dbName,
+	names.schemaName,
+	names.tableName,
+	names.statsName,
+	[s].[auto_created], 
+	[s].[no_recompute], 
+	[sp].[last_updated],
+	[sp].[rows],
+	[sp].[rows_sampled],
+	[sp].[steps],
+	[sp].[unfiltered_rows],
+	[sp].[modification_counter],
+	sampleRate = (1.0*sp.rows_sampled/sp.rows)*100,
+	'UPDATE STATISTICS ' + names.schemaName + '.' + names.tableName + '(' + names.statsName + ')'
+FROM [sys].[stats] s
+CROSS APPLY [sys].[dm_db_stats_properties]([s].[object_id],[s].[stats_id]) sp
+INNER JOIN [sys].[tables] t
+	ON [s].[object_id] = [t].[object_id] 
+CROSS APPLY (
+				SELECT (1.0*[sp].[modification_counter]/NULLIF([sp].[rows],0))*100
+				) AS rowmodcounter(modPercent)
+CROSS APPLY (SELECT 	
+	dbName			= DB_NAME(),
+	schemaName		= SCHEMA_NAME(t.schema_id),
+	tableName		= t.[name], 
+	statsName		= s.[name]
+	) AS names
+WHERE 
+	(t.[object_id] = @objectID OR @objectID IS NULL) 
+	--AND [t].[is_ms_shipped] =0
+	AND OBJECTPROPERTY(s.[object_id],'IsMSShipped')=0 
+	AND [rowmodcounter].[modPercent] >@modPercentLimit
+ORDER BY [rowmodcounter].[modPercent] DESC;
+GO
+
+EXEC sp_ms_marksystemobject 'dbo.sp_sqlservice_check_statistics' -- mark the procedure as system procedure
+
+EXEC Sp_MSForEachDB 'use ?;exec dbo.sp_sqlservice_check_statistics NULL,NULL, 0.01' -- check every database in the SQL server instance
