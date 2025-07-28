@@ -105,3 +105,50 @@ GROUP BY
 	node_id,physical_operator_name,row_count,estimate_row_count,last_active_time,first_active_time
 ORDER BY 
 	node_id DESC;
+
+
+SELECT  er.session_id AS SessionID,
+        DB_NAME(er.database_id) DatabaseName, er.start_time, 
+        DATEDIFF(ss,er.start_time,GETDATE()) AS ElapsedTime_Sec,
+        er.wait_type AS WaitType, 
+        er.wait_time WaitTime_MS, 
+        SUBSTRING(est.TEXT, (er.statement_start_offset / 2) + 1,
+                ((CASE er.statement_end_offset WHEN -1 
+                        THEN DATALENGTH(est.[TEXT]) 
+                        ELSE er.statement_end_offset END
+                        - er.statement_start_offset) / 2) + 1) AS statement_text, 
+        CONVERT(XML, qp.query_plan) QueryPlan, 
+        100.0 * SUM(eqp.row_count) / SUM(eqp.estimate_row_count) AS PercentComplete
+FROM        sys.dm_exec_requests er
+INNER JOIN  sys.dm_exec_query_profiles eqp ON er.session_id = eqp.session_id AND er.request_id = eqp.request_id
+CROSS APPLY sys.dm_exec_sql_text(er.sql_handle) est
+CROSS APPLY sys.dm_exec_text_query_plan(er.plan_handle, er.statement_start_offset, er.statement_end_offset) qp
+WHERE       er.session_id > 50 AND er.session_id != @@spid
+GROUP BY    er.start_time, er.session_id, er.wait_type, er.wait_time, est.[TEXT], 
+            er.statement_start_offset, er.statement_end_offset, 
+            qp.query_plan, er.database_id
+HAVING      SUM(eqp.estimate_row_count) > 0
+
+
+SELECT er.start_time, datediff(ms, er.start_time, getdate()) elapsed_time_ms,
+er.session_id, er.wait_type, er.wait_time,
+SUBSTRING(st.text, (er.statement_start_offset/2)+1,
+((CASE er.statement_end_offset
+WHEN -1 THEN DATALENGTH(st.text)
+ELSE er.statement_end_offset
+END - er.statement_start_offset)/2) + 1) AS statement_text,
+CONVERT(XML, qp.query_plan) query_plan,
+CASE WHEN sum(eqp.estimate_row_count) > 0 THEN
+100 * SUM(eqp.row_count)/SUM(eqp.estimate_row_count)
+ELSE
+NULL
+END AS percent_done
+FROM sys.dm_exec_requests er
+INNER JOIN sys.dm_exec_query_profiles eqp ON er.session_id = eqp.session_id
+AND er.request_id = eqp.request_id
+CROSS APPLY sys.dm_exec_sql_text(er.sql_handle) st
+CROSS APPLY sys.dm_exec_text_query_plan(er.plan_handle, er.statement_start_offset, er.statement_end_offset) qp
+WHERE er.session_id > 50 and er.session_id != @@spid
+GROUP BY er.start_time, er.session_id, er.wait_type, er.wait_time, st.text,
+er.statement_start_offset, er.statement_end_offset, qp.query_plan
+HAVING SUM(eqp.estimate_row_count) > 0
