@@ -1,0 +1,46 @@
+Resource semaphore
+SELECT     physical_memory_in_use_kb / 1024 AS Used_MB,    large_page_allocations_kb / 1024 AS LargePages_MB,    locked_page_allocations_kb / 1024 AS LockedPages_MB,    virtual_address_space_reserved_kb / 1024 AS VAS_Reserved_MB,    virtual_address_space_committed_kb / 1024 AS VAS_Committed_MB,    virtual_address_space_available_kb / 1024 AS VAS_Available_MB,    page_fault_count,    memory_utilization_percentage,    process_physical_memory_low,    process_virtual_memory_lowFROM sys.dm_os_process_memory;
+process_physical_memory_low = 1 → indicates memory pressureLow VAS_Available_MB → virtual memory fragmentationSELECT     type,     SUM(single_pages_kb + multi_pages_kb + virtual_memory_committed_kb) / 1024 AS Total_MBFROM sys.dm_os_memory_clerksGROUP BY typeORDER BY Total_MB DESC;
+SELECT    mg.requested_memory_kb / 1024.0 AS Requested_MB,    mg.granted_memory_kb / 1024.0 AS Granted_MB,    mg.used_memory_kb / 1024.0 AS Used_MB,    mg.request_time,    mg.grant_time,    mg.is_next,    r.status,    t.text AS sql_textFROM sys.dm_exec_query_memory_grants mgJOIN sys.dm_exec_requests r ON mg.session_id = r.session_idCROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t;
+
+https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/performance/troubleshoot-memory-grant-issues
+
+SELECT     mg.session_id,    mg.requested_memory_kb / 1024 AS requested_memory_MB,    mg.granted_memory_kb / 1024 AS granted_memory_MB,    mg.used_memory_kb / 1024 AS used_memory_MB,    mg.max_used_memory_kb / 1024 AS max_used_memory_MB,    r.status,    r.command,    r.dop,    t.textFROM sys.dm_exec_query_memory_grants mgJOIN sys.dm_exec_requests r ON mg.session_id = r.session_idCROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS tWHERE mg.requested_memory_kb > 0;
+Per-thread grant = requested_memory_kb / dop
+SELECT     session_id,    request_id,    COUNT(*) AS worker_countFROM sys.dm_os_tasksWHERE session_id IN (SELECT session_id FROM sys.dm_exec_requests)GROUP BY session_id, request_id;
+
+--set dop
+-- Detects CPU layout and recommends MAXDOP based on MSFT guidance
+WITH CPU_Info AS (    SELECT         COUNT(*) AS total_schedulers,        
+SUM(CASE WHEN status = 'VISIBLE ONLINE' THEN 1 ELSE 0 END) AS visible_online_schedulers    FROM sys.dm_os_schedulers    
+WHERE scheduler_id < 1048576  -- Filter out the DAC scheduler),Numa_Info AS (    SELECT         COUNT(DISTINCT parent_node_id) AS numa_node_count    FROM sys.dm_os_schedulers    WHERE status = 'VISIBLE ONLINE' AND scheduler_id < 1048576),CPU_Recommendation AS (    SELECT         v.visible_online_schedulers AS total_cores,        n.numa_node_count AS numa_nodes,        CASE             WHEN v.visible_online_schedulers <= 8 THEN v.visible_online_schedulers            WHEN v.visible_online_schedulers <= 32 THEN 8            WHEN v.visible_online_schedulers > 32 THEN 16        END AS recommended_maxdop    FROM CPU_Info v    CROSS JOIN Numa_Info n)SELECT     total_cores,    numa_nodes,    recommended_maxdop,    'USE: EXEC sp_configure ''max degree of parallelism'', ' +         CAST(recommended_maxdop AS VARCHAR(10)) + '; RECONFIGURE;' AS recommendation_scriptFROM CPU_Recommendation;
+
+| Environment                 | Recommended MAXDOP                   |
+| --------------------------- | ------------------------------------ |
+| <= 8 logical processors     | Same as number of logical processors |
+| > 8 and single NUMA node    | 8                                    |
+| > 8 and multiple NUMA nodes | Number of cores per NUMA node        |
+| OLTP workload               | Typically 1 to 4 (may vary)          |
+
+
+--T-SQL Script: Analyze Plan Cache for Parallel Queries
+-- Analyze cached plans for parallelism and their estimated cost
+WITH ParallelPlans AS (    SELECT         qs.plan_handle,        qs.execution_count,        qs.total_worker_time,        qs.total_elapsed_time,        qs.total_logical_reads,        qs.creation_time,        qp.query_plan,        cp.usecounts,        cp.size_in_bytes,        p.n.value('(//RelOp/@Parallel)[1]', 'varchar(5)') AS is_parallel,        p.n.value('(//StmtSimple/@StatementSubTreeCost)[1]', 'float') AS estimated_cost    FROM sys.dm_exec_query_stats qs    CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle, DEFAULT, DEFAULT) AS qp    JOIN sys.dm_exec_cached_plans cp ON qs.plan_handle = cp.plan_handle    CROSS APPLY qp.query_plan.nodes('//BatchSequence/Batch/Statements/StmtSimple') AS p(n)    WHERE cp.cacheobjtype = 'Compiled Plan')SELECT     COUNT(*) AS total_parallel_plans,    MIN(estimated_cost) AS min_parallel_cost,    MAX(estimated_cost) AS max_parallel_cost,    AVG(estimated_cost) AS avg_parallel_cost,    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p25_cost,    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p50_cost,    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p75_cost,    PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p90_costFROM ParallelPlansWHERE is_parallel = '1';-- Analyze cached plans for parallelism and their estimated costWITH ParallelPlans AS (    SELECT         qs.plan_handle,        qs.execution_count,        qs.total_worker_time,        qs.total_elapsed_time,        qs.total_logical_reads,        qs.creation_time,        qp.query_plan,        cp.usecounts,        cp.size_in_bytes,        p.n.value('(//RelOp/@Parallel)[1]', 'varchar(5)') AS is_parallel,        p.n.value('(//StmtSimple/@StatementSubTreeCost)[1]', 'float') AS estimated_cost    FROM sys.dm_exec_query_stats qs    CROSS APPLY sys.dm_exec_text_query_plan(qs.plan_handle, DEFAULT, DEFAULT) AS qp    JOIN sys.dm_exec_cached_plans cp ON qs.plan_handle = cp.plan_handle    CROSS APPLY qp.query_plan.nodes('//BatchSequence/Batch/Statements/StmtSimple') AS p(n)    WHERE cp.cacheobjtype = 'Compiled Plan')SELECT     COUNT(*) AS total_parallel_plans,    MIN(estimated_cost) AS min_parallel_cost,    MAX(estimated_cost) AS max_parallel_cost,    AVG(estimated_cost) AS avg_parallel_cost,    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p25_cost,    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p50_cost,    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p75_cost,    PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY estimated_cost) OVER () AS p90_costFROM ParallelPlansWHERE is_parallel = '1';
+| Value                    | Meaning                                   || ------------------------ | ----------------------------------------- || `min_parallel_cost`      | Smallest cost where a query went parallel || `avg_parallel_cost`      | Average cost of all parallel queries      || `p75_cost` or `p90_cost` | Use this as a **CTFP candidate**          |
+
+| Metric                   | Value  |
+| ------------------------ | ------ |
+| total\_parallel\_queries | 1563   |
+| min\_parallel\_cost      | 5.123  |
+| avg\_parallel\_cost      | 18.900 |
+| p75\_cost                | 23.456 |
+| p90\_cost                | 30.789 |
+
+--Use p75_cost or p90_cost as candidates for your cost threshold for parallelism setting.
+
+
+| total\_parallel\_plans | min\_parallel\_cost | avg\_parallel\_cost | p75\_cost | p90\_cost || ---------------------- | ------------------- | ------------------- | --------- | --------- || 1438                   | 9.2                 | 58.7                | 48.5      | 75.2      |
+
+If min_parallel_cost = 9.2 and p75_cost = 48.5 → set CTFP to 50This prevents low-cost queries (like 9 or 10) from running in parallelKeeps parallelism available for truly expensive queries| Scenario                           | Recommended Action                                    || ---------------------------------- | ----------------------------------------------------- || Many parallel plans with cost < 20 | Raise `CTFP` to 25–30                                 || 75%+ of parallel plans cost > 50   | Set `CTFP` = 50                                       || OLTP workload with high CPU        | Set `CTFP` = 50–75 and monitor                        || Reporting workload                 | Possibly leave `CTFP` lower, or use Resource Governor |
+
+
