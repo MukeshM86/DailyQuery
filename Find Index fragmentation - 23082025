@@ -1,0 +1,96 @@
+-- Find tables involved in a query
+
+WITH XMLNAMESPACES(DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
+SELECT
+    n.value('(@Database)[1]', 'VARCHAR(100)') AS DatabaseName,
+    n.value('(@Schema)[1]', 'VARCHAR(100)') AS SchemaName,
+    n.value('(@Table)[1]', 'VARCHAR(100)') AS TableName
+FROM 
+    sys.dm_exec_requests r
+    CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) qp
+    CROSS APPLY qp.query_plan.nodes('//Object') AS q(n)
+WHERE 
+    r.session_id = <YourSessionID>;
+
+-- Find tables involved in a query and find fragmentation
+
+WITH XMLNAMESPACES(DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
+SELECT
+    n.value('(@Database)[1]', 'VARCHAR(128)') AS DatabaseName,
+    n.value('(@Schema)[1]', 'VARCHAR(128)') AS SchemaName,
+    n.value('(@Table)[1]', 'VARCHAR(128)') AS TableName
+INTO #TempTableList
+FROM 
+    sys.dm_exec_requests r
+    CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) qp
+    CROSS APPLY qp.query_plan.nodes('//Object') AS q(n)
+WHERE 
+    r.session_id = <YourSessionID>;
+
+DECLARE @dbName SYSNAME, @sql NVARCHAR(MAX);
+
+-- Cursor to iterate over each table in the temp table
+DECLARE table_cursor CURSOR FOR
+SELECT DISTINCT DatabaseName, SchemaName, TableName FROM #TempTableList;
+
+OPEN table_cursor;
+FETCH NEXT FROM table_cursor INTO @dbName, @sql, @sql;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = '
+    USE [' + @dbName + '];
+    SELECT 
+        ''' + @dbName + ''' AS DatabaseName,
+        OBJECT_SCHEMA_NAME(ps.object_id) AS SchemaName,
+        OBJECT_NAME(ps.object_id) AS TableName,
+        i.name AS IndexName,
+        ps.index_type_desc,
+        ps.avg_fragmentation_in_percent
+    FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, ''LIMITED'') AS ps
+    JOIN sys.indexes AS i ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+    WHERE OBJECT_NAME(ps.object_id) = ''' + @sql + ''';';
+
+    EXEC sp_executesql @sql;
+
+    FETCH NEXT FROM table_cursor INTO @dbName, @sql, @sql;
+END
+
+CLOSE table_cursor;
+DEALLOCATE table_cursor;
+
+DROP TABLE #TempTableList;
+
+
+--Check Fragmentation of Specific Tables
+-- List your tables here
+DECLARE @Tables TABLE (
+    SchemaName SYSNAME,
+    TableName SYSNAME
+);
+
+-- Add the tables you want to check
+INSERT INTO @Tables (SchemaName, TableName)
+VALUES 
+    ('dbo', 'Customers'),
+    ('dbo', 'Orders'),
+    ('sales', 'Invoices');  -- Add more as needed
+
+-- Check fragmentation
+SELECT 
+    t.SchemaName,
+    t.TableName,
+    i.name AS IndexName,
+    ps.index_type_desc,
+    ps.avg_fragmentation_in_percent,
+    ps.fragment_count,
+    ps.page_count
+FROM @Tables t
+JOIN sys.objects o ON o.name = t.TableName AND SCHEMA_NAME(o.schema_id) = t.SchemaName
+JOIN sys.indexes i ON i.object_id = o.object_id
+CROSS APPLY sys.dm_db_index_physical_stats (
+    DB_ID(), o.object_id, i.index_id, NULL, 'LIMITED'
+) AS ps
+WHERE i.index_id > 0  -- Exclude heaps (optional)
+ORDER BY 
+    t.SchemaName, t.TableName, ps.avg_fragmentation_in_percent DESC;
