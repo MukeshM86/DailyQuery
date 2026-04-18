@@ -1,0 +1,44 @@
+Query progress
+
+SELECT 
+    qp.node_id,
+    qp.physical_operator_name,
+    qp.thread_id,
+    qp.row_count AS [Actual_Rows],
+    qp.estimate_row_count AS [Estimated_Rows],
+    -- Calculation for progress percentage
+    CAST(qp.row_count * 100.0 / NULLIF(qp.estimate_row_count, 0) AS DECIMAL(5,2)) AS [Percent_Done],
+    -- Time and Resource Usage
+    qp.elapsed_time_ms / 1000 AS [Seconds_Active],
+    qp.cpu_time_ms / 1000 AS [CPU_Seconds],
+    qp.logical_read_count AS [Reads],
+    -- Crucial for 50M row tables: identifies TempDB spills
+    qp.write_page_count AS [Pages_Spilled_To_Disk],
+    -- Wait information
+    wt.wait_type,
+    wt.wait_duration_ms,
+    wt.blocking_session_id AS [Blocked_By],
+    wt.resource_description
+FROM sys.dm_exec_query_profiles qp
+LEFT JOIN sys.dm_os_waiting_tasks wt 
+    ON qp.task_address = wt.waiting_task_address
+WHERE qp.session_id = <YOUR_SPID> 
+ORDER BY qp.node_id DESC, qp.thread_id;
+
+Go
+SELECT 
+    qp.node_id,
+    qp.physical_operator_name,
+    qp.thread_id,
+    qp.row_count AS [Rows_On_This_Thread],
+    -- New: Difference between this thread and the average for this node
+    qp.row_count - AVG(qp.row_count) OVER (PARTITION BY qp.node_id) AS [Skew_Delta],
+    qp.estimate_row_count / NULLIF(MAX(qp.thread_id) OVER (PARTITION BY qp.node_id), 0) AS [Estimated_Rows_Per_Thread],
+    qp.cpu_time_ms,
+    qp.logical_read_count,
+    wt.wait_type
+FROM sys.dm_exec_query_profiles qp
+LEFT JOIN sys.dm_os_waiting_tasks wt 
+    ON qp.task_address = wt.waiting_task_address
+WHERE qp.session_id = <YOUR_SPID>
+ORDER BY qp.node_id DESC, qp.thread_id;
