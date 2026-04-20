@@ -1,0 +1,94 @@
+--1. The Historical View (Transaction Log)
+
+SELECT 
+    [Transaction Name], 
+    Operation, 
+    Context, 
+    AllocUnitName, 
+    [Page ID], 
+    [Slot ID]
+FROM sys.fn_dblog(NULL, NULL)
+WHERE [Transaction Name] LIKE '%Split%' -- Looking for LOP_DELETE_SPLIT or LOP_INSERT_SPLIT
+AND AllocUnitName LIKE 'dbo.YourTableName%';
+
+--2  The Current Cumulative View (DMVs)
+
+SELECT 
+    OBJECT_NAME(s.object_id) AS TableName,
+    i.name AS IndexName,
+    s.leaf_allocation_count AS TotalPageSplits,
+    s.nonleaf_allocation_count AS UpperLevelSplits
+FROM sys.dm_db_index_operational_stats(DB_ID(), OBJECT_ID('YourTableName'), NULL, NULL) s
+JOIN sys.indexes i ON s.object_id = i.object_id AND s.index_id = i.index_id;
+
+--2nd query update
+SELECT 
+    OBJECT_NAME(ios.object_id) AS [Table_Name], 
+    i.name AS [Index_Name],
+    ps.row_count AS [Actual_Row_Count],
+    ios.leaf_allocation_count AS [Leaf_Page_Splits],
+    ios.nonleaf_allocation_count AS [NonLeaf_Page_Splits],
+    ios.leaf_update_count AS [Updates]
+FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS ios
+INNER JOIN sys.indexes AS i 
+    ON ios.index_id = i.index_id 
+    AND ios.object_id = i.object_id
+INNER JOIN sys.dm_db_partition_stats AS ps 
+    ON i.object_id = ps.object_id 
+    AND i.index_id = ps.index_id
+    AND ios.partition_number = ps.partition_number
+WHERE OBJECTPROPERTY(ios.object_id, 'IsUserTable') = 1
+ORDER BY ios.leaf_allocation_count DESC;
+
+
+DECLARE @TableName NVARCHAR(255) = 'YourTableName'; -- Put your table name here
+
+SELECT 
+    OBJECT_NAME(ios.object_id) AS [Table_Name], 
+    i.name AS [Index_Name],
+    ps.row_count AS [Actual_Row_Count],
+    ios.leaf_allocation_count AS [Leaf_Page_Splits],
+    ios.nonleaf_allocation_count AS [NonLeaf_Page_Splits],
+    ios.leaf_update_count AS [Updates]
+FROM sys.dm_db_index_operational_stats(DB_ID(), OBJECT_ID(@TableName), NULL, NULL) AS ios
+INNER JOIN sys.indexes AS i 
+    ON ios.index_id = i.index_id 
+    AND ios.object_id = i.object_id
+INNER JOIN sys.dm_db_partition_stats AS ps 
+    ON i.object_id = ps.object_id 
+    AND i.index_id = ps.index_id
+    AND ios.partition_number = ps.partition_number
+WHERE ios.object_id = OBJECT_ID(@TableName);
+
+
+
+/*
+Leaf_allocation_count: This is your primary metric. High numbers here relative to your row count suggest your Fill Factor is too tight.
+*/
+/*
+ you see Leaf_Page_Splits approaching or exceeding the Actual_Row_Count, your index is likely fragmented and suffering from "Mid-page splits."
+*/
+
+SELECT 
+    i.name AS IndexName,
+    s.leaf_allocation_count AS LeafSplits -- "Bad" splits happen here
+FROM sys.dm_db_index_operational_stats(DB_ID(), OBJECT_ID('YourTable'), NULL, NULL) s
+JOIN sys.indexes i ON s.object_id = i.object_id AND s.index_id = i.index_id
+WHERE i.type_desc = 'NONCLUSTERED'; -- Check your non-clustered indexes first
+
+/*
+
+Run this and note the LeafSplits count
+
+Perform the update that usually takes 2–3 minutes).
+
+3. Check the "Odometer" After the Update
+Run the same script again.
+
+The Math: AfterCount - BeforeCount = Page Splits caused by your update.
+
+The Verdict: If you see that your update caused 50,000+ splits, that is why it is taking minutes. Each split is a physical disk write and a lock.
+
+*/
+
+-- live tracking extended events
