@@ -1,0 +1,342 @@
+# ============================================================
+#  DBA Diagnostics Tool
+#  Author  : Generated Script
+#  Purpose : SQL Server health checks – Long Running Queries,
+#            Blocking, and Disk Space
+# ============================================================
+
+#region ── Helper Functions ─────────────────────────────────
+
+function Write-Banner {
+    Clear-Host
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "        SQL Server DBA Diagnostics Tool      " -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Write-SectionHeader($title) {
+    Write-Host ""
+    Write-Host "---------------------------------------------" -ForegroundColor Yellow
+    Write-Host "  $title" -ForegroundColor Yellow
+    Write-Host "---------------------------------------------" -ForegroundColor Yellow
+}
+
+function Invoke-SqlQuery {
+    param(
+        [string]$ServerInstance,
+        [string]$Username,
+        [System.Security.SecureString]$SecurePassword,
+        [string]$Query,
+        [string]$Database = "master"
+    )
+
+    $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+    )
+
+    $connectionString = "Server=$ServerInstance;Database=$Database;" +
+                        "User Id=$Username;Password=$plainPassword;" +
+                        "Connection Timeout=30;TrustServerCertificate=True;"
+
+    $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    $connection.Open()
+
+    $command             = $connection.CreateCommand()
+    $command.CommandText = $Query
+    $command.CommandTimeout = 120
+
+    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($command)
+    $dataSet = New-Object System.Data.DataSet
+    $adapter.Fill($dataSet) | Out-Null
+
+    $connection.Close()
+    return $dataSet.Tables[0]
+}
+
+#endregion
+
+#region ── Step 1 : Collect Connection Details ──────────────
+
+Write-Banner
+
+Write-Host "  Please enter SQL Server connection details." -ForegroundColor White
+Write-Host ""
+
+# Server + port
+$rawServer = Read-Host "  Server name / IP"
+$rawPort   = Read-Host "  Port (press Enter for default 1433)"
+
+if ([string]::IsNullOrWhiteSpace($rawPort)) { $rawPort = "1433" }
+
+$ServerInstance = "$rawServer,$rawPort"
+
+# Credentials
+$Username      = Read-Host "  Username"
+$SecurePassword = Read-Host "  Password" -AsSecureString
+
+#endregion
+
+#region ── Step 2 : Test Connection ─────────────────────────
+
+Write-Host ""
+Write-Host "  Testing connection to $ServerInstance …" -ForegroundColor Gray
+
+try {
+    $testQuery = "SELECT @@SERVERNAME AS ServerName, @@VERSION AS Version"
+    $testResult = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                  -Username $Username `
+                                  -SecurePassword $SecurePassword `
+                                  -Query $testQuery
+
+    Write-Host ""
+    Write-Host "  [OK] Connected successfully!" -ForegroundColor Green
+    Write-Host "  Server : $($testResult.Rows[0]['ServerName'])" -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "  [ERROR] Could not connect to $ServerInstance" -ForegroundColor Red
+    Write-Host "  Details: $_" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Please verify server name, port, username and password." -ForegroundColor Red
+    Write-Host ""
+    Read-Host "  Press Enter to exit"
+    exit 1
+}
+
+#endregion
+
+#region ── Step 3 : Main Menu ───────────────────────────────
+
+:MainLoop while ($true) {
+
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "  Select a diagnostic option:" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  1. Long Running Queries  (sp_WhoIsActive)" -ForegroundColor White
+    Write-Host "  2. Blocking              (blocking chains)" -ForegroundColor White
+    Write-Host "  3. Disk Space            (total & free)"   -ForegroundColor White
+    Write-Host "  Q. Quit" -ForegroundColor White
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $choice = Read-Host "  Enter option (1 / 2 / 3 / Q)"
+
+    switch ($choice.Trim().ToUpper()) {
+
+        #─── Option 1 : Long Running Queries via sp_WhoIsActive ───────────
+
+        "1" {
+            Write-SectionHeader "Long Running Queries — sp_WhoIsActive (dba database)"
+
+            # Check whether sp_WhoIsActive exists in the dba database
+            $checkQuery = "SELECT COUNT(1) AS cnt FROM dba.sys.objects
+                           WHERE name = 'sp_WhoIsActive' AND type = 'P'"
+            try {
+                $checkResult = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                               -Username $Username `
+                                               -SecurePassword $SecurePassword `
+                                               -Query $checkQuery `
+                                               -Database "dba"
+
+                if ($checkResult.Rows[0]['cnt'] -eq 0) {
+                    Write-Host ""
+                    Write-Host "  [WARN] sp_WhoIsActive is NOT found in the [dba] database." -ForegroundColor Yellow
+                    Write-Host "  Please install it there: https://whoisactive.com/" -ForegroundColor Yellow
+                }
+                else {
+                    # sp_WhoIsActive IS installed in dba
+                    $wiaQuery = "EXEC dba.dbo.sp_WhoIsActive
+                                    @filter_type         = 'session',
+                                    @show_sleeping_spids = 0,
+                                    @show_own_spid       = 0"
+
+                    $data = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $wiaQuery `
+                                            -Database "dba"
+
+                    if ($data.Rows.Count -eq 0) {
+                        Write-Host ""
+                        Write-Host "  No active queries detected at this moment." -ForegroundColor Green
+                    } else {
+                        Write-Host ""
+                        Write-Host "  Active sessions (sp_WhoIsActive output):" -ForegroundColor White
+                        $data | Format-Table -AutoSize | Out-String | Write-Host
+                    }
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        #─── Option 2 : Blocking ──────────────────────────────────────────
+
+        "2" {
+            Write-SectionHeader "Blocking Chains"
+
+            $blockingQuery = "
+                ;WITH BlockingChain AS (
+                    SELECT
+                        session_id,
+                        blocking_session_id,
+                        wait_type,
+                        wait_time / 1000                  AS wait_sec,
+                        total_elapsed_time / 1000         AS elapsed_sec,
+                        DB_NAME(database_id)              AS [database],
+                        status
+                    FROM sys.dm_exec_requests
+                    WHERE blocking_session_id <> 0
+                )
+                SELECT
+                    bc.blocking_session_id   AS blocker_spid,
+                    s_blocker.login_name     AS blocker_login,
+                    s_blocker.host_name      AS blocker_host,
+                    s_blocker.program_name   AS blocker_app,
+                    SUBSTRING(bt.text, 1, 500) AS blocker_query,
+                    bc.session_id            AS blocked_spid,
+                    s_blocked.login_name     AS blocked_login,
+                    s_blocked.host_name      AS blocked_host,
+                    bc.wait_type,
+                    bc.wait_sec,
+                    bc.elapsed_sec,
+                    bc.[database],
+                    SUBSTRING(t.text, 1, 500) AS blocked_query
+                FROM BlockingChain bc
+                JOIN sys.dm_exec_sessions s_blocker
+                    ON bc.blocking_session_id = s_blocker.session_id
+                JOIN sys.dm_exec_sessions s_blocked
+                    ON bc.session_id = s_blocked.session_id
+                OUTER APPLY (
+                    SELECT sql_handle FROM sys.dm_exec_requests
+                    WHERE session_id = bc.blocking_session_id
+                ) br
+                OUTER APPLY sys.dm_exec_sql_text(br.sql_handle) bt
+                OUTER APPLY (
+                    SELECT sql_handle FROM sys.dm_exec_requests
+                    WHERE session_id = bc.session_id
+                ) bdr
+                OUTER APPLY sys.dm_exec_sql_text(bdr.sql_handle) t
+                ORDER BY bc.wait_sec DESC"
+
+            try {
+                $data = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                        -Username $Username `
+                                        -SecurePassword $SecurePassword `
+                                        -Query $blockingQuery
+
+                if ($data.Rows.Count -eq 0) {
+                    Write-Host ""
+                    Write-Host "  No blocking detected at this moment." -ForegroundColor Green
+                } else {
+                    Write-Host ""
+                    Write-Host "  Blocking chains found:" -ForegroundColor Red
+                    $data | Format-Table -AutoSize | Out-String | Write-Host
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        #─── Option 3 : Disk Space ────────────────────────────────────────
+
+        "3" {
+            Write-SectionHeader "Disk Space — Total & Available"
+
+            $diskQuery = "
+                SELECT DISTINCT
+                    volume_mount_point          AS [Drive],
+                    CAST(total_bytes / 1073741824.0 AS DECIMAL(10,2))
+                                                AS [Total_GB],
+                    CAST(available_bytes / 1073741824.0 AS DECIMAL(10,2))
+                                                AS [Free_GB],
+                    CAST((total_bytes - available_bytes) / 1073741824.0 AS DECIMAL(10,2))
+                                                AS [Used_GB],
+                    CAST(available_bytes * 100.0 / total_bytes AS DECIMAL(5,2))
+                                                AS [Free_Pct]
+                FROM sys.dm_os_volume_stats(1, 1)
+                -- Covers all drives with at least one database file
+                CROSS JOIN (
+                    SELECT DISTINCT volume_mount_point
+                    FROM sys.master_files mf
+                    CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id)
+                ) drives
+                ORDER BY [Drive]"
+
+            # Alternate simpler query that works on all editions
+            $diskQuerySimple = "
+                SELECT
+                    volume_mount_point          AS [Drive],
+                    CAST(total_bytes / 1073741824.0 AS DECIMAL(10,2)) AS [Total_GB],
+                    CAST(available_bytes / 1073741824.0 AS DECIMAL(10,2)) AS [Free_GB],
+                    CAST((total_bytes - available_bytes) / 1073741824.0 AS DECIMAL(10,2)) AS [Used_GB],
+                    CAST(available_bytes * 100.0 / total_bytes AS DECIMAL(5,2)) AS [Free_Pct]
+                FROM (
+                    SELECT DISTINCT
+                        volume_mount_point,
+                        total_bytes,
+                        available_bytes
+                    FROM sys.master_files AS f
+                    CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.file_id)
+                ) AS vol
+                ORDER BY [Drive]"
+
+            try {
+                $data = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                        -Username $Username `
+                                        -SecurePassword $SecurePassword `
+                                        -Query $diskQuerySimple
+
+                if ($data.Rows.Count -eq 0) {
+                    Write-Host ""
+                    Write-Host "  No disk data returned. Ensure VIEW SERVER STATE permission." -ForegroundColor Yellow
+                } else {
+                    Write-Host ""
+                    Write-Host "  Disk space per volume:" -ForegroundColor White
+                    Write-Host ""
+
+                    foreach ($row in $data.Rows) {
+                        $freePct = [double]$row['Free_Pct']
+                        $color   = if ($freePct -lt 10) { "Red" }
+                                   elseif ($freePct -lt 20) { "Yellow" }
+                                   else { "Green" }
+
+                        $line = "  Drive: {0,-8}  Total: {1,8} GB   Used: {2,8} GB   Free: {3,8} GB   Free%: {4,6}%" -f `
+                                $row['Drive'], $row['Total_GB'], $row['Used_GB'], $row['Free_GB'], $row['Free_Pct']
+
+                        Write-Host $line -ForegroundColor $color
+                    }
+                    Write-Host ""
+                    Write-Host "  Color key: " -NoNewline
+                    Write-Host "Green = OK   " -ForegroundColor Green -NoNewline
+                    Write-Host "Yellow = Low (<20%)   " -ForegroundColor Yellow -NoNewline
+                    Write-Host "Red = Critical (<10%)" -ForegroundColor Red
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        #─── Quit ─────────────────────────────────────────────────────────
+
+        "Q" {
+            Write-Host ""
+            Write-Host "  Exiting DBA Diagnostics Tool. Goodbye!" -ForegroundColor Cyan
+            Write-Host ""
+            break MainLoop
+        }
+
+        default {
+            Write-Host ""
+            Write-Host "  Invalid option. Please enter 1, 2, 3, or Q." -ForegroundColor Red
+        }
+    }
+
+    Write-Host ""
+    Read-Host "  Press Enter to return to the menu"
+}
