@@ -1,0 +1,204 @@
+================================================================================
+FILE 2: DIAGNOSE SP CALLED MULTIPLE TIMES IN BATCH BY A SERVICE
+================================================================================
+PROBLEM STATEMENT:
+  The stored procedure is being called repeatedly by an external service
+  in batch mode. Even a slightly inefficient SP becomes catastrophic when
+  called 10x, 50x, or 100x per second. These queries help confirm frequency,
+  concurrency, and CPU compounding.
+
+WHEN TO RUN:
+  Run during the batch window when the service is actively calling the SP.
+
+REFERENCE VALUES TO CHANGE:
+  >> Replace 'YourStoredProcName' with your actual stored procedure name
+  >> Replace 60 in WAITFOR DELAY with your desired snapshot interval (seconds)
+
+THRESHOLD GUIDANCE:
+  - execution_count growth > 50/min  : Very aggressive batch -- throttle service
+  - avg_cpu_ms > 500 per exec        : Each call is expensive -- fix the query
+  - Concurrent sessions > 10         : Risk of CXPACKET / lock contention
+  - recompile_count > 0              : Plan recompiling -- wasting CPU on compile
+
+================================================================================
+QUERY 1: CONFIRM EXECUTION FREQUENCY -- HOW MANY TIMES SP WAS CALLED
+================================================================================
+PURPOSE : Shows total execution count, total and average CPU consumed by
+          the SP since SQL Server last restarted. Direct proof of batch impact.
+
+COLUMNS TO CHECK:
+  - execution_count      : Total times SP was called since restart
+  - total_cpu_ms         : Total CPU consumed across all executions (ms)
+  - avg_cpu_ms           : CPU per single call
+                           >> If avg is 200ms and called 100x/sec = 20,000ms/sec
+  - last_execution_time  : When was it last called
+
+REPLACE:
+  >> 'YourStoredProcName' with your SP name
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    OBJECT_NAME(ps.object_id)                              AS sp_name,
+    ps.execution_count,
+    ps.total_worker_time / 1000                            AS total_cpu_ms,
+    ps.total_worker_time / ps.execution_count / 1000       AS avg_cpu_ms,
+    ps.last_execution_time,
+    ps.cached_time
+FROM sys.dm_exec_procedure_stats ps
+WHERE OBJECT_NAME(ps.object_id) = 'YourStoredProcName'
+ORDER BY ps.total_worker_time DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 2: FIND ALL CONCURRENT SESSIONS RUNNING THE SAME SP RIGHT NOW
+================================================================================
+PURPOSE : Shows how many sessions are simultaneously executing your SP.
+          If you see 20-50 rows -- the batch is hammering SQL Server.
+
+COLUMNS TO CHECK:
+  - session_id           : Each row = one concurrent execution
+  - status               : 'running' = active, 'suspended' = waiting
+  - cpu_time             : CPU consumed by this session so far
+  - wait_type            : What the session is waiting for (see table below)
+  - blocking_session_id  : Non-zero = this session is blocked by another
+
+WAIT TYPE REFERENCE:
+  WAIT TYPE              MEANING                        ACTION
+  ---------------------- ------------------------------ ----------------------
+  CXPACKET               Parallelism threads waiting    Add MAXDOP 1 hint
+  SOS_SCHEDULER_YIELD    CPU fully saturated            Optimize query
+  LCK_M_XX               Lock contention between calls  Review transaction scope
+  PAGEIOLATCH_XX         Reading from disk (not cache)  Check memory/indexes
+  RESOURCE_SEMAPHORE     Memory pressure                Review max server memory
+
+REPLACE:
+  >> 'YourStoredProcName' with your SP name
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    r.session_id,
+    r.status,
+    r.cpu_time,
+    r.start_time,
+    r.total_elapsed_time,
+    r.wait_type,
+    r.blocking_session_id,
+    s.text
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) s
+WHERE s.text LIKE '%YourStoredProcName%'
+ORDER BY r.cpu_time DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 3: SNAPSHOT COMPARISON -- CALLS PER MINUTE + CPU BURN RATE
+================================================================================
+PURPOSE : Run Snapshot 1, wait 60 seconds, run Snapshot 2.
+          Shows exactly how many times the SP was called per minute
+          and how much CPU was burned during that window.
+
+HOW TO USE:
+  Step 1: Run the "Snapshot 1" block -- saves current counts to temp table
+  Step 2: Wait 60 seconds (or your preferred interval)
+  Step 3: Run the "Snapshot 2 + Comparison" block -- shows the delta
+
+COLUMNS TO CHECK:
+  - new_executions       : Calls made during your wait window
+                           >> Divide by wait seconds to get calls/sec
+  - cpu_consumed_ms      : Total CPU burned during the window (ms)
+                           >> High here = confirmed batch CPU problem
+
+REPLACE:
+  >> 'YourStoredProcName' with your SP name
+  >> Change WAITFOR DELAY '00:01:00' if you want a different interval
+
+--------------------------------------------------------------------------------
+
+-- STEP 1: Take first snapshot (run this first)
+IF OBJECT_ID('tempdb..#before') IS NOT NULL DROP TABLE #before;
+
+SELECT 
+    OBJECT_NAME(object_id)  AS sp_name,
+    execution_count,
+    total_worker_time
+INTO #before
+FROM sys.dm_exec_procedure_stats
+WHERE OBJECT_NAME(object_id) = 'YourStoredProcName';
+
+-- STEP 2: Wait 60 seconds
+WAITFOR DELAY '00:01:00';
+
+-- STEP 3: Compare snapshots
+SELECT 
+    b.sp_name,
+    b.execution_count                                       AS exec_before,
+    ps.execution_count                                      AS exec_after,
+    ps.execution_count - b.execution_count                  AS new_executions,
+    (ps.total_worker_time - b.total_worker_time) / 1000    AS cpu_consumed_ms
+FROM #before b
+JOIN sys.dm_exec_procedure_stats ps 
+    ON OBJECT_NAME(ps.object_id) = b.sp_name;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 4: CHECK WAIT STATS FOR ALL SESSIONS -- IDENTIFY PRESSURE TYPE
+================================================================================
+PURPOSE : Shows what ALL sessions are waiting on right now.
+          Helps identify if the batch is causing lock contention,
+          CPU saturation, or IO pressure server-wide.
+
+COLUMNS TO CHECK:
+  - wait_type            : Type of bottleneck (see reference table above)
+  - wait_time_ms         : How long session has been waiting
+  - blocking_session_id  : Session causing the block (0 = not blocked)
+
+THRESHOLD:
+  - wait_time_ms > 5000  : Session waiting too long -- investigate
+  - blocking_session_id != 0 : Active blocking chain -- check that session
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    session_id,
+    wait_type,
+    wait_time_ms,
+    blocking_session_id
+FROM sys.dm_exec_requests
+WHERE wait_type IS NOT NULL
+ORDER BY wait_time_ms DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+FIXES SPECIFIC TO BATCH CALL PATTERN
+================================================================================
+
+  PROBLEM                        FIX
+  ------------------------------ ------------------------------------------------
+  Called too frequently          Add caching at app/service layer
+  Parameter sniffing bad plan    Add OPTION(RECOMPILE) at end of SELECT
+  Plan recompiling each call     Check recompile_count in procedure_stats
+  No covering index              Add index on WHERE cols + INCLUDE output cols
+  Parallelism per call           Add MAXDOP 1 hint to the SELECT
+  Batch too aggressive           Throttle service -- add delay/queue between calls
+  Same data fetched every call   Cache result at application layer (Redis etc.)
+
+PARAMETER SNIFFING FIX EXAMPLE:
+  -- Add this hint to the SELECT inside your SP:
+  SELECT col1, col2
+  FROM your_table
+  WHERE col3 = @param
+  OPTION (RECOMPILE);          -- Forces fresh plan every execution
+
+================================================================================
+END OF FILE 2
+================================================================================

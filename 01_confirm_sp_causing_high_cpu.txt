@@ -1,0 +1,173 @@
+================================================================================
+FILE 1: CONFIRM THAT A SPECIFIC STORED PROCEDURE IS CAUSING HIGH CPU
+================================================================================
+PROBLEM STATEMENT:
+  A single SELECT statement inside a stored procedure is causing SQL Server
+  CPU to spike up to 90%. These queries help you confirm which SP is the culprit.
+
+WHEN TO RUN:
+  Run these queries WHILE the CPU spike is happening (live/real-time).
+
+REFERENCE VALUES TO CHANGE:
+  >> Replace 'YourStoredProcName' with your actual stored procedure name
+     in ALL queries below.
+
+THRESHOLD GUIDANCE:
+  - CPU > 70%     : High -- Investigate immediately
+  - CPU > 85%     : Critical -- SP is starving other processes
+  - Logical Reads > 100,000 per query : Indicates missing index
+  - Elapsed Time  > 5000 ms           : Query is too slow for batch use
+
+================================================================================
+QUERY 1: CATCH RUNNING QUERIES LIVE -- SORTED BY CPU (Run during spike)
+================================================================================
+PURPOSE : Shows all currently RUNNING queries with their CPU usage and
+          execution plan. If your SP's SELECT is at the top, it's confirmed.
+
+COLUMNS TO CHECK:
+  - cpu_time        : Higher = more CPU consumed by that session
+  - logical_reads   : High value = missing index (each read = CPU work)
+  - query_plan      : Open in SSMS to view graphical execution plan
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    r.session_id,
+    r.cpu_time,
+    r.total_elapsed_time,
+    r.logical_reads,
+    s.text AS sql_text,
+    qp.query_plan
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) s
+CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) qp
+WHERE r.status = 'running'
+ORDER BY r.cpu_time DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 2: HISTORICALLY EXPENSIVE QUERIES -- SINCE LAST SQL SERVER RESTART
+================================================================================
+PURPOSE : Shows TOP 20 queries that have consumed the most CPU historically.
+          Run this even AFTER the spike to identify the pattern.
+
+COLUMNS TO CHECK:
+  - avg_cpu         : Average CPU per single execution (ms)
+                      >> If > 500ms and called 100x/sec = disaster
+  - total_cpu       : Total CPU consumed since SQL Server last restarted
+  - execution_count : How many times this query ran
+  - statement_text  : The exact SELECT/statement inside the SP
+
+THRESHOLD:
+  - avg_cpu > 1000 ms  : Optimize this query urgently
+  - avg_cpu > 5000 ms  : Critical -- rewrite or re-index immediately
+
+--------------------------------------------------------------------------------
+
+SELECT TOP 20
+    qs.total_worker_time / qs.execution_count       AS avg_cpu,
+    qs.total_worker_time                            AS total_cpu,
+    qs.execution_count,
+    SUBSTRING(
+        st.text,
+        (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+          END - qs.statement_start_offset) / 2) + 1
+    ) AS statement_text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+ORDER BY qs.total_worker_time DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 3: CHECK MISSING INDEXES RECOMMENDED BY SQL SERVER
+================================================================================
+PURPOSE : SQL Server internally tracks indexes it wishes existed. Run this
+          to find missing indexes on tables used by your SP.
+
+COLUMNS TO CHECK:
+  - avg_user_impact   : % performance gain if this index is created
+                        >> Prioritize indexes with impact > 80%
+  - equality_columns  : Columns used in WHERE col = value
+  - inequality_columns: Columns used in WHERE col > / < / BETWEEN
+  - included_columns  : Columns needed in SELECT (add to INCLUDE clause)
+
+THRESHOLD:
+  - avg_user_impact > 80%  : Create this index -- high gain
+  - avg_user_impact 50-80% : Review and consider creating
+  - avg_user_impact < 50%  : Lower priority
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    mid.statement                           AS table_name,
+    migs.avg_user_impact                    AS estimated_improvement_pct,
+    migs.user_seeks                         AS times_this_index_was_needed,
+    mid.equality_columns,
+    mid.inequality_columns,
+    mid.included_columns
+FROM sys.dm_db_missing_index_details mid
+JOIN sys.dm_db_missing_index_groups mig
+    ON mid.index_handle = mig.index_handle
+JOIN sys.dm_db_missing_index_group_stats migs
+    ON mig.index_group_handle = migs.group_handle
+ORDER BY migs.avg_user_impact DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 4: UPDATE STATISTICS & VERIFY EXECUTION STATS
+================================================================================
+PURPOSE : Stale statistics cause SQL Server to pick bad execution plans,
+          leading to unnecessary CPU usage.
+
+HOW TO USE:
+  Step 1 -- Check current execution stats with IO and TIME:
+            Run the SET STATISTICS block before and after your SP.
+  Step 2 -- Update statistics on suspected tables.
+
+REPLACE:
+  >> 'your_stored_procedure' with your actual SP name
+  >> 'your_table'            with the table used in the SELECT
+
+WHAT TO LOOK FOR IN OUTPUT:
+  - CPU time      : Time spent on CPU (ms) -- should go DOWN after fix
+  - Elapsed time  : Wall clock time -- affected by locks/IO too
+  - Logical reads : Reads from memory -- high = missing index
+  - Physical reads: Reads from disk -- high = data not cached
+
+--------------------------------------------------------------------------------
+
+-- Step 1: Run SP with stats
+SET STATISTICS IO, TIME ON;
+EXEC your_stored_procedure;
+SET STATISTICS IO, TIME OFF;
+
+-- Step 2: Update statistics on the table
+UPDATE STATISTICS your_table;
+
+--------------------------------------------------------------------------------
+
+================================================================================
+COMMON ROOT CAUSES FOR HIGH CPU ON A SINGLE SELECT
+================================================================================
+
+  SYMPTOM                        CAUSE                    FIX
+  ------------------------------ ------------------------ ----------------------
+  High logical_reads             Missing index            Create covering index
+  High CPU, low reads            Implicit type conversion Match data types in WHERE
+  Plan changes randomly          Parameter sniffing       OPTION(RECOMPILE) hint
+  High CPU after data growth     Stale statistics         UPDATE STATISTICS
+  Waits: CXPACKET               Too many parallel threads MAXDOP 1 hint
+  Waits: SOS_SCHEDULER_YIELD    Pure CPU pressure        Optimize query logic
+
+================================================================================
+END OF FILE 1
+================================================================================

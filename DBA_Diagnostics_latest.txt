@@ -1,0 +1,1076 @@
+# ============================================================
+#  DBA Diagnostics Tool
+#  Purpose : SQL Server health checks
+#            1. Long Running Queries (sp_WhoIsActive)
+#            2. Blocking             (Head Blocker Chain)
+#            3. Disk Space           (Total & Free)
+#            4. SQL Server CPU Usage (current & historical)
+#            5. Database Size        (data, log, total)
+#            6. Memory               (total, available, clerks, top queries)
+#            7. Backup History       (last backup per database)
+# ============================================================
+
+#region Helper Functions
+
+function Write-Banner {
+    Clear-Host
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "        SQL Server DBA Diagnostics Tool      " -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+function Write-SectionHeader($title) {
+    Write-Host ""
+    Write-Host "---------------------------------------------" -ForegroundColor Yellow
+    Write-Host "  $title" -ForegroundColor Yellow
+    Write-Host "---------------------------------------------" -ForegroundColor Yellow
+}
+
+function Invoke-SqlQuery {
+    param(
+        [string]$ServerInstance,
+        [string]$Username,
+        [System.Security.SecureString]$SecurePassword,
+        [string]$Query,
+        [string]$Database = "master"
+    )
+
+    $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+    )
+
+    $connectionString = "Server=$ServerInstance;Database=$Database;" +
+                        "User Id=$Username;Password=$plainPassword;" +
+                        "Connection Timeout=30;TrustServerCertificate=True;"
+
+    $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    $connection.Open()
+
+    $command             = $connection.CreateCommand()
+    $command.CommandText = $Query
+    $command.CommandTimeout = 120
+
+    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($command)
+    $dataSet = New-Object System.Data.DataSet
+    $adapter.Fill($dataSet) | Out-Null
+
+    $connection.Close()
+    return $dataSet.Tables[0]
+}
+
+function Draw-Bar {
+    param([int]$Pct, [int]$Len = 40)
+    $filled = [math]::Round($Pct * $Len / 100)
+    return "[" + ("#" * $filled) + ("-" * ($Len - $filled)) + "]"
+}
+
+#endregion
+
+#region Step 1 : Connection Details
+
+Write-Banner
+
+Write-Host "  Please enter SQL Server connection details." -ForegroundColor White
+Write-Host ""
+
+$rawServer = Read-Host "  Server name / IP"
+$rawPort   = Read-Host "  Port (press Enter for default 1433)"
+
+if ([string]::IsNullOrWhiteSpace($rawPort)) { $rawPort = "1433" }
+
+$ServerInstance = "$rawServer,$rawPort"
+$Username       = Read-Host "  Username"
+$SecurePassword = Read-Host "  Password" -AsSecureString
+
+#endregion
+
+#region Step 2 : Test Connection
+
+Write-Host ""
+Write-Host "  Testing connection to $ServerInstance ..." -ForegroundColor Gray
+
+try {
+    $testResult = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                  -Username $Username `
+                                  -SecurePassword $SecurePassword `
+                                  -Query "SELECT @@SERVERNAME AS ServerName"
+
+    Write-Host ""
+    Write-Host "  [OK] Connected successfully!" -ForegroundColor Green
+    Write-Host "  Server : $($testResult.Rows[0]['ServerName'])" -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "  [ERROR] Could not connect to $ServerInstance" -ForegroundColor Red
+    Write-Host "  Details: $_" -ForegroundColor Red
+    Write-Host ""
+    Read-Host "  Press Enter to exit"
+    exit 1
+}
+
+#endregion
+
+#region Step 3 : Main Menu
+
+:MainLoop while ($true) {
+
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "  Select a diagnostic option:"                -ForegroundColor White
+    Write-Host ""
+    Write-Host "  1. Long Running Queries  (sp_WhoIsActive)"   -ForegroundColor White
+    Write-Host "  2. Blocking              (head blocker chain)" -ForegroundColor White
+    Write-Host "  3. Disk Space            (total & free)"     -ForegroundColor White
+    Write-Host "  4. CPU Usage             (SQL Server CPU)"   -ForegroundColor White
+    Write-Host "  5. Database Size         (data, log, total)" -ForegroundColor White
+    Write-Host "  6. Memory                (total, available, clerks, top queries)" -ForegroundColor White
+    Write-Host "  7. Backup History        (last backup per database)" -ForegroundColor White
+    Write-Host "  Q. Quit"                                     -ForegroundColor White
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    $choice = Read-Host "  Enter option (1 / 2 / 3 / 4 / 5 / 6 / 7 / Q)"
+
+    switch ($choice.Trim().ToUpper()) {
+
+        # ------------------------------------------------------------
+        # Option 1 : Long Running Queries - ALL sp_WhoIsActive columns
+        # ------------------------------------------------------------
+        "1" {
+            Write-SectionHeader "Long Running Queries - sp_WhoIsActive (dba database)"
+
+            $checkQ = "SELECT COUNT(1) AS cnt FROM dba.sys.objects WHERE name = 'sp_WhoIsActive' AND type = 'P'"
+
+            try {
+                $chk = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                       -Username $Username `
+                                       -SecurePassword $SecurePassword `
+                                       -Query $checkQ `
+                                       -Database "dba"
+
+                if ($chk.Rows[0]['cnt'] -eq 0) {
+                    Write-Host ""
+                    Write-Host "  [WARN] sp_WhoIsActive is NOT found in the [dba] database." -ForegroundColor Yellow
+                    Write-Host "  Please install it: https://whoisactive.com/" -ForegroundColor Yellow
+                }
+                else {
+                    $wiaQ = @"
+IF OBJECT_ID('tempdb..##WIA') IS NOT NULL DROP TABLE ##WIA;
+
+EXEC dba.dbo.sp_WhoIsActive
+    @filter_type         = 'session',
+    @show_sleeping_spids = 0,
+    @show_own_spid       = 0,
+    @get_full_inner_text = 1,
+    @get_plans           = 0,
+    @get_locks           = 0,
+    @destination_table   = '##WIA';
+
+SELECT
+    session_id,
+    [dd hh:mm:ss.mss]    AS elapsed_time,
+    status,
+    login_name,
+    host_name,
+    database_name,
+    program_name,
+    sql_text,
+    wait_info,
+    blocking_session_id,
+    cpu,
+    reads,
+    writes,
+    physical_reads,
+    tempdb_allocations,
+    tempdb_current,
+    used_memory,
+    open_tran_count,
+    percent_complete,
+    tran_start_time,
+    start_time,
+    login_time,
+    request_id,
+    collection_time
+FROM ##WIA
+ORDER BY [dd hh:mm:ss.mss] DESC;
+
+DROP TABLE ##WIA;
+"@
+
+                    $data = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $wiaQ `
+                                            -Database "dba"
+
+                    if ($data.Rows.Count -eq 0) {
+                        Write-Host ""
+                        Write-Host "  No active queries at this moment." -ForegroundColor Green
+                    }
+                    else {
+                        Write-Host ""
+                        Write-Host "  Active sessions - all sp_WhoIsActive columns:" -ForegroundColor White
+                        Write-Host ""
+
+                        foreach ($row in $data.Rows) {
+
+                            $isBlocked = ($null -ne $row['blocking_session_id'] `
+                                          -and $row['blocking_session_id'] -ne [DBNull]::Value `
+                                          -and [string]$row['blocking_session_id'] -notin @('','0'))
+
+                            $hc = if ($isBlocked) { "Red" } else { "Cyan" }
+
+                            Write-Host ("  == SPID {0,-6} [{1}]  elapsed: {2}  db: {3}  login: {4}" -f `
+                                $row['session_id'], $row['status'], $row['elapsed_time'],
+                                $row['database_name'], $row['login_name']) -ForegroundColor $hc
+
+                            if ($isBlocked) {
+                                Write-Host "     *** BLOCKED by SPID $($row['blocking_session_id']) ***" -ForegroundColor Red
+                            }
+
+                            Write-Host "     Host            : $($row['host_name'])"          -ForegroundColor Gray
+                            Write-Host "     Program         : $($row['program_name'])"        -ForegroundColor Gray
+                            Write-Host "     Wait Info       : $($row['wait_info'])"           -ForegroundColor Gray
+                            Write-Host "     CPU             : $($row['cpu'])"                 -ForegroundColor Gray
+                            Write-Host ("     Reads: {0}   Writes: {1}   Physical Reads: {2}" -f `
+                                $row['reads'], $row['writes'], $row['physical_reads'])          -ForegroundColor Gray
+                            Write-Host ("     TempDB Alloc: {0}   TempDB Current: {1}" -f `
+                                $row['tempdb_allocations'], $row['tempdb_current'])             -ForegroundColor Gray
+                            Write-Host "     Memory (KB)     : $($row['used_memory'])"         -ForegroundColor Gray
+                            Write-Host ("     Open Trans: {0}   Pct Complete: {1}" -f `
+                                $row['open_tran_count'], $row['percent_complete'])              -ForegroundColor Gray
+                            Write-Host "     Tran Start Time : $($row['tran_start_time'])"     -ForegroundColor Gray
+                            Write-Host "     Start Time      : $($row['start_time'])"          -ForegroundColor Gray
+                            Write-Host "     Login Time      : $($row['login_time'])"          -ForegroundColor Gray
+                            Write-Host "     Request ID      : $($row['request_id'])"          -ForegroundColor Gray
+                            Write-Host "     Collection Time : $($row['collection_time'])"     -ForegroundColor Gray
+                            Write-Host "     SQL Text        :" -ForegroundColor Yellow
+                            Write-Host "       $(($row['sql_text'] -replace '\s+',' ').Trim())" -ForegroundColor White
+                            Write-Host ""
+                        }
+
+                        Write-Host "  Total active sessions: $($data.Rows.Count)" -ForegroundColor Cyan
+                    }
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Option 2 : Blocking - Head Blocker Chain
+        # ------------------------------------------------------------
+        "2" {
+            Write-SectionHeader "Blocking Chains - Head Blocker View"
+
+            $blockQ = @"
+;WITH
+AllBlocked AS (
+    SELECT session_id, blocking_session_id
+    FROM sys.dm_exec_requests
+    WHERE blocking_session_id <> 0
+),
+BlockingTree AS (
+    SELECT
+        r.session_id,
+        r.blocking_session_id,
+        r.blocking_session_id       AS head_blocker_spid,
+        r.wait_type,
+        r.wait_time / 1000          AS wait_sec,
+        r.total_elapsed_time / 1000 AS elapsed_sec,
+        DB_NAME(r.database_id)      AS [database],
+        r.status,
+        1                           AS chain_depth
+    FROM sys.dm_exec_requests r
+    WHERE r.blocking_session_id <> 0
+      AND r.blocking_session_id NOT IN (SELECT session_id FROM AllBlocked)
+
+    UNION ALL
+
+    SELECT
+        r.session_id,
+        r.blocking_session_id,
+        bt.head_blocker_spid,
+        r.wait_type,
+        r.wait_time / 1000,
+        r.total_elapsed_time / 1000,
+        DB_NAME(r.database_id),
+        r.status,
+        bt.chain_depth + 1
+    FROM sys.dm_exec_requests r
+    JOIN BlockingTree bt ON r.blocking_session_id = bt.session_id
+    WHERE r.blocking_session_id <> 0
+)
+SELECT
+    bt.head_blocker_spid,
+    s_h.login_name                          AS head_blocker_login,
+    s_h.host_name                           AS head_blocker_host,
+    s_h.program_name                        AS head_blocker_app,
+    s_h.status                              AS head_blocker_status,
+    SUBSTRING(ISNULL(ht.text,''), 1, 300)   AS head_blocker_query,
+    bt.session_id                           AS blocked_spid,
+    bt.blocking_session_id                  AS direct_blocker_spid,
+    bt.chain_depth,
+    s_b.login_name                          AS blocked_login,
+    s_b.host_name                           AS blocked_host,
+    s_b.program_name                        AS blocked_app,
+    bt.wait_type,
+    bt.wait_sec,
+    bt.elapsed_sec,
+    bt.[database],
+    bt.status                               AS blocked_status,
+    SUBSTRING(ISNULL(bk.text,''), 1, 300)   AS blocked_query
+FROM BlockingTree bt
+JOIN sys.dm_exec_sessions s_h ON bt.head_blocker_spid = s_h.session_id
+JOIN sys.dm_exec_sessions s_b ON bt.session_id        = s_b.session_id
+OUTER APPLY (SELECT sql_handle FROM sys.dm_exec_requests WHERE session_id = bt.head_blocker_spid) hr
+OUTER APPLY sys.dm_exec_sql_text(hr.sql_handle) ht
+OUTER APPLY (SELECT sql_handle FROM sys.dm_exec_requests WHERE session_id = bt.session_id) br
+OUTER APPLY sys.dm_exec_sql_text(br.sql_handle) bk
+ORDER BY bt.head_blocker_spid, bt.chain_depth, bt.wait_sec DESC;
+"@
+
+            try {
+                $data = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                        -Username $Username `
+                                        -SecurePassword $SecurePassword `
+                                        -Query $blockQ
+
+                if ($data.Rows.Count -eq 0) {
+                    Write-Host ""
+                    Write-Host "  No blocking detected at this moment." -ForegroundColor Green
+                }
+                else {
+                    $headBlockers = $data.Rows | Select-Object -ExpandProperty head_blocker_spid -Unique
+
+                    foreach ($hbSpid in $headBlockers) {
+
+                        $hbRows = $data.Rows | Where-Object { $_.head_blocker_spid -eq $hbSpid }
+                        $first  = $hbRows | Select-Object -First 1
+
+                        Write-Host ""
+                        Write-Host "  ====================================================" -ForegroundColor Red
+                        Write-Host "  HEAD BLOCKER  >>  SPID: $hbSpid" -ForegroundColor Red
+                        Write-Host "  ====================================================" -ForegroundColor Red
+                        Write-Host "  Login   : $($first['head_blocker_login'])"  -ForegroundColor Yellow
+                        Write-Host "  Host    : $($first['head_blocker_host'])"   -ForegroundColor Yellow
+                        Write-Host "  App     : $($first['head_blocker_app'])"    -ForegroundColor Yellow
+                        Write-Host "  Status  : $($first['head_blocker_status'])" -ForegroundColor Yellow
+                        Write-Host "  Query   : $(($first['head_blocker_query'] -replace '\s+',' ').Trim())" -ForegroundColor Yellow
+                        Write-Host ""
+                        Write-Host "  Blocked sessions in this chain:" -ForegroundColor White
+
+                        foreach ($row in $hbRows) {
+                            $depth = [int]$row['chain_depth']
+                            $pad   = "  " + ("    " * $depth)
+                            $arrow = if ($depth -gt 1) { "L-- " } else { "+-- " }
+
+                            Write-Host ""
+                            Write-Host ("{0}{1}SPID {2}  (blocked by SPID {3}  |  depth: {4})" -f `
+                                $pad, $arrow, $row['blocked_spid'], $row['direct_blocker_spid'], $depth) -ForegroundColor Cyan
+
+                            Write-Host "$pad     Login    : $($row['blocked_login'])"   -ForegroundColor Gray
+                            Write-Host "$pad     Host     : $($row['blocked_host'])"    -ForegroundColor Gray
+                            Write-Host "$pad     App      : $($row['blocked_app'])"     -ForegroundColor Gray
+                            Write-Host "$pad     Database : $($row['database'])"        -ForegroundColor Gray
+                            Write-Host "$pad     Status   : $($row['blocked_status'])"  -ForegroundColor Gray
+                            Write-Host "$pad     Wait     : $($row['wait_type'])  |  waiting $($row['wait_sec'])s  |  elapsed $($row['elapsed_sec'])s" -ForegroundColor Gray
+                            Write-Host "$pad     Query    : $(($row['blocked_query'] -replace '\s+',' ').Trim())" -ForegroundColor Gray
+                        }
+
+                        Write-Host ""
+                    }
+
+                    Write-Host "  --------------------------------------------------" -ForegroundColor Red
+                    Write-Host "  Total blocked sessions : $($data.Rows.Count)" -ForegroundColor Red
+                    Write-Host "  Unique head blockers   : $($headBlockers.Count)" -ForegroundColor Red
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Option 3 : Disk Space
+        # ------------------------------------------------------------
+        "3" {
+            Write-SectionHeader "Disk Space - Total & Available"
+
+            $diskQ = @"
+SELECT
+    volume_mount_point                                                    AS [Drive],
+    CAST(total_bytes     / 1073741824.0 AS DECIMAL(10,2))                 AS [Total_GB],
+    CAST(available_bytes / 1073741824.0 AS DECIMAL(10,2))                 AS [Free_GB],
+    CAST((total_bytes - available_bytes) / 1073741824.0 AS DECIMAL(10,2)) AS [Used_GB],
+    CAST(available_bytes * 100.0 / total_bytes AS DECIMAL(5,2))           AS [Free_Pct]
+FROM (
+    SELECT DISTINCT volume_mount_point, total_bytes, available_bytes
+    FROM sys.master_files AS f
+    CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.file_id)
+) AS vol
+ORDER BY [Drive];
+"@
+
+            try {
+                $data = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                        -Username $Username `
+                                        -SecurePassword $SecurePassword `
+                                        -Query $diskQ
+
+                if ($data.Rows.Count -eq 0) {
+                    Write-Host ""
+                    Write-Host "  No disk data returned. Ensure VIEW SERVER STATE permission." -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host ""
+                    Write-Host "  Disk space per volume:" -ForegroundColor White
+                    Write-Host ""
+
+                    foreach ($row in $data.Rows) {
+                        $freePct = [double]$row['Free_Pct']
+                        $color   = if ($freePct -lt 10)  { "Red" }
+                                   elseif ($freePct -lt 20) { "Yellow" }
+                                   else { "Green" }
+
+                        $line = "  Drive: {0,-8}  Total: {1,8} GB   Used: {2,8} GB   Free: {3,8} GB   Free%: {4,6}%" -f `
+                                $row['Drive'], $row['Total_GB'], $row['Used_GB'], $row['Free_GB'], $row['Free_Pct']
+
+                        Write-Host $line -ForegroundColor $color
+                    }
+
+                    Write-Host ""
+                    Write-Host "  Color key: " -NoNewline
+                    Write-Host "Green = OK  "           -ForegroundColor Green  -NoNewline
+                    Write-Host "Yellow = Low (<20%)  "  -ForegroundColor Yellow -NoNewline
+                    Write-Host "Red = Critical (<10%)"  -ForegroundColor Red
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Option 4 : SQL Server CPU Usage
+        # ------------------------------------------------------------
+        "4" {
+            Write-SectionHeader "SQL Server CPU Usage"
+
+            $cpuCurrentQ = @"
+SELECT TOP 1
+    CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]','int')   AS sql_cpu_pct,
+    CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int')           AS system_idle_pct,
+    100 - CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int')     AS total_cpu_pct,
+    100
+    - CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int')
+    - CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]','int') AS other_process_cpu_pct,
+    GETDATE()                                                                                                AS captured_at
+FROM sys.dm_os_ring_buffers
+WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+ORDER BY CAST(record AS XML).value('(./Record/@id)[1]','bigint') DESC;
+"@
+
+            $cpuHistoryQ = @"
+SELECT TOP 30
+    DATEADD(ms, -1 * (osi.ms_ticks - CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/@time)[1]','bigint')), GETDATE()) AS sample_time,
+    CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]','int') AS sql_cpu_pct,
+    100 - CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int')
+    - CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]','int') AS other_cpu_pct,
+    CAST(record AS XML).value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int') AS idle_pct
+FROM sys.dm_os_ring_buffers
+CROSS JOIN sys.dm_os_sys_info osi
+WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+ORDER BY CAST(record AS XML).value('(./Record/@id)[1]','bigint') DESC;
+"@
+
+            $cpuSessionsQ = @"
+SELECT TOP 10
+    s.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    DB_NAME(r.database_id)       AS database_name,
+    r.cpu_time                   AS cpu_ms,
+    r.total_elapsed_time / 1000  AS elapsed_sec,
+    r.reads,
+    r.writes,
+    r.status,
+    SUBSTRING(t.text, 1, 200)    AS sql_text
+FROM sys.dm_exec_sessions s
+JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE s.session_id <> @@SPID
+ORDER BY r.cpu_time DESC;
+"@
+
+            try {
+                $snapData = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $cpuCurrentQ
+
+                Write-Host ""
+                Write-Host "  Current CPU Snapshot  (captured: $($snapData.Rows[0]['captured_at']))" -ForegroundColor White
+                Write-Host ""
+
+                $sqlCpu   = [int]$snapData.Rows[0]['sql_cpu_pct']
+                $totCpu   = [int]$snapData.Rows[0]['total_cpu_pct']
+                $otherCpu = [int]$snapData.Rows[0]['other_process_cpu_pct']
+                $idlePct  = [int]$snapData.Rows[0]['system_idle_pct']
+
+                $sqlColor = if ($sqlCpu -gt 80) { "Red" } elseif ($sqlCpu -gt 50) { "Yellow" } else { "Green" }
+                $totColor = if ($totCpu -gt 90) { "Red" } elseif ($totCpu -gt 70) { "Yellow" } else { "Green" }
+
+                Write-Host ("  SQL Server CPU : {0,3}%  {1}" -f $sqlCpu, (Draw-Bar $sqlCpu)) -ForegroundColor $sqlColor
+                Write-Host ("  Total OS CPU   : {0,3}%  {1}" -f $totCpu, (Draw-Bar $totCpu)) -ForegroundColor $totColor
+                Write-Host ("  Other Procs    : {0,3}%" -f $otherCpu) -ForegroundColor Gray
+                Write-Host ("  System Idle    : {0,3}%" -f $idlePct)  -ForegroundColor Gray
+
+                $histData = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $cpuHistoryQ
+
+                Write-Host ""
+                Write-Host "  CPU History - last 30 samples (newest first):" -ForegroundColor White
+                Write-Host ""
+                Write-Host ("  {0,-22}  {1,10}  {2,10}  {3,8}" -f "Sample Time","SQL CPU%","Other CPU%","Idle%") -ForegroundColor White
+                Write-Host ("  {0,-22}  {1,10}  {2,10}  {3,8}" -f ("-"*22),("-"*10),("-"*10),("-"*8)) -ForegroundColor DarkGray
+
+                foreach ($row in $histData.Rows) {
+                    $sc = [int]$row['sql_cpu_pct']
+                    $rc = if ($sc -gt 80) { "Red" } elseif ($sc -gt 50) { "Yellow" } else { "Green" }
+                    Write-Host ("  {0,-22}  {1,10}  {2,10}  {3,8}" -f `
+                        $row['sample_time'], $row['sql_cpu_pct'], $row['other_cpu_pct'], $row['idle_pct']) -ForegroundColor $rc
+                }
+
+                $sessData = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $cpuSessionsQ
+
+                Write-Host ""
+                Write-Host "  Top 10 CPU Consuming Sessions right now:" -ForegroundColor White
+                Write-Host ""
+
+                if ($sessData.Rows.Count -eq 0) {
+                    Write-Host "  No active sessions found." -ForegroundColor Green
+                }
+                else {
+                    foreach ($row in $sessData.Rows) {
+                        Write-Host ("  SPID {0,-6} CPU: {1,8} ms  Elapsed: {2,6}s  [{3}]  Login: {4}  DB: {5}" -f `
+                            $row['session_id'], $row['cpu_ms'], $row['elapsed_sec'],
+                            $row['status'], $row['login_name'], $row['database_name']) -ForegroundColor Cyan
+                        Write-Host "    Host   : $($row['host_name'])   App: $($row['program_name'])" -ForegroundColor Gray
+                        Write-Host "    SQL    : $(($row['sql_text'] -replace '\s+',' ').Trim())" -ForegroundColor Gray
+                        Write-Host ""
+                    }
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Option 5 : Database Size
+        # ------------------------------------------------------------
+        "5" {
+            Write-SectionHeader "Database Size - Data, Log & Total"
+
+            $dbSizeQ = @"
+SELECT
+    d.name                                                              AS [Database],
+    d.state_desc                                                        AS [State],
+    d.recovery_model_desc                                               AS [Recovery_Model],
+    CAST(SUM(CASE WHEN mf.type = 0 THEN mf.size END) * 8.0 / 1024 / 1024 AS DECIMAL(12,2)) AS [Data_GB],
+    CAST(SUM(CASE WHEN mf.type = 1 THEN mf.size END) * 8.0 / 1024 / 1024 AS DECIMAL(12,2)) AS [Log_GB],
+    CAST(SUM(mf.size) * 8.0 / 1024 / 1024 AS DECIMAL(12,2))           AS [Total_GB],
+    COUNT(DISTINCT CASE WHEN mf.type = 0 THEN mf.file_id END)          AS [Data_Files],
+    COUNT(DISTINCT CASE WHEN mf.type = 1 THEN mf.file_id END)          AS [Log_Files]
+FROM sys.databases d
+JOIN sys.master_files mf ON d.database_id = mf.database_id
+WHERE d.state = 0
+GROUP BY d.name, d.database_id, d.state_desc, d.recovery_model_desc
+ORDER BY [Total_GB] DESC;
+"@
+
+            $logSpaceQ = @"
+SELECT
+    DB_NAME(database_id)                                    AS [Database],
+    CAST(total_log_size_mb / 1024.0 AS DECIMAL(10,2))       AS [Log_Total_GB],
+    CAST(used_log_space_mb  / 1024.0 AS DECIMAL(10,2))      AS [Log_Used_GB],
+    CAST(used_log_space_in_percent AS DECIMAL(5,2))          AS [Log_Used_Pct]
+FROM sys.dm_db_log_space_usage;
+"@
+
+            try {
+                $sizeData = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $dbSizeQ
+
+                Write-Host ""
+                Write-Host ("  {0,-30}  {1,-10}  {2,-14}  {3,8}  {4,8}  {5,8}  {6,5}  {7,5}" -f `
+                    "Database","State","Recovery","Data_GB","Log_GB","Total_GB","D.Files","L.Files") -ForegroundColor White
+                Write-Host ("  {0,-30}  {1,-10}  {2,-14}  {3,8}  {4,8}  {5,8}  {6,5}  {7,5}" -f `
+                    ("-"*30),("-"*10),("-"*14),("-"*8),("-"*8),("-"*8),("-"*5),("-"*5)) -ForegroundColor DarkGray
+
+                $grandTotal = 0.0
+                foreach ($row in $sizeData.Rows) {
+                    $total = [double]$row['Total_GB']
+                    $grandTotal += $total
+                    $color = if ($total -gt 500) { "Red" } elseif ($total -gt 100) { "Yellow" } else { "Cyan" }
+                    Write-Host ("  {0,-30}  {1,-10}  {2,-14}  {3,8}  {4,8}  {5,8}  {6,5}  {7,5}" -f `
+                        $row['Database'], $row['State'], $row['Recovery_Model'],
+                        $row['Data_GB'], $row['Log_GB'], $row['Total_GB'],
+                        $row['Data_Files'], $row['Log_Files']) -ForegroundColor $color
+                }
+
+                Write-Host ""
+                Write-Host ("  Grand Total: {0:N2} GB across all online databases" -f $grandTotal) -ForegroundColor White
+
+                Write-Host ""
+                Write-Host "  Log Space Usage per Database:" -ForegroundColor White
+                Write-Host ""
+
+                try {
+                    $logData = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                               -Username $Username `
+                                               -SecurePassword $SecurePassword `
+                                               -Query $logSpaceQ
+
+                    Write-Host ("  {0,-30}  {1,14}  {2,13}  {3,12}" -f "Database","Log_Total_GB","Log_Used_GB","Log_Used_%") -ForegroundColor White
+                    Write-Host ("  {0,-30}  {1,14}  {2,13}  {3,12}" -f ("-"*30),("-"*14),("-"*13),("-"*12)) -ForegroundColor DarkGray
+
+                    foreach ($row in $logData.Rows) {
+                        $lp = [double]$row['Log_Used_Pct']
+                        $lc = if ($lp -gt 80) { "Red" } elseif ($lp -gt 60) { "Yellow" } else { "Green" }
+                        Write-Host ("  {0,-30}  {1,14}  {2,13}  {3,12}" -f `
+                            $row['Database'], $row['Log_Total_GB'], $row['Log_Used_GB'], $row['Log_Used_Pct']) -ForegroundColor $lc
+                    }
+
+                    Write-Host ""
+                    Write-Host "  Log color key: " -NoNewline
+                    Write-Host "Green = OK  "           -ForegroundColor Green  -NoNewline
+                    Write-Host "Yellow = High (>60%)  " -ForegroundColor Yellow -NoNewline
+                    Write-Host "Red = Critical (>80%)" -ForegroundColor Red
+                }
+                catch {
+                    Write-Host "  (Log space detail unavailable - $_)" -ForegroundColor DarkGray
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Option 6 : Memory
+        # ------------------------------------------------------------
+        "6" {
+            Write-SectionHeader "Memory - Total, Available & Details"
+
+            # Section A: OS + SQL Server memory overview
+            $memOverviewQ = @"
+SELECT
+    -- Physical memory
+    CAST(total_physical_memory_kb  / 1048576.0 AS DECIMAL(10,2)) AS [Total_Physical_GB],
+    CAST(available_physical_memory_kb / 1048576.0 AS DECIMAL(10,2)) AS [Available_Physical_GB],
+    CAST((total_physical_memory_kb - available_physical_memory_kb) / 1048576.0 AS DECIMAL(10,2)) AS [Used_Physical_GB],
+    CAST(available_physical_memory_kb * 100.0 / total_physical_memory_kb AS DECIMAL(5,2)) AS [Available_Pct],
+    -- Virtual memory
+    CAST(total_virtual_address_space_kb / 1048576.0 AS DECIMAL(10,2)) AS [Total_Virtual_GB],
+    CAST(available_virtual_address_space_kb / 1048576.0 AS DECIMAL(10,2)) AS [Available_Virtual_GB],
+    -- Page file
+    CAST(total_page_file_kb / 1048576.0 AS DECIMAL(10,2)) AS [Total_PageFile_GB],
+    CAST(available_page_file_kb / 1048576.0 AS DECIMAL(10,2)) AS [Available_PageFile_GB],
+    system_memory_state_desc AS [Memory_State]
+FROM sys.dm_os_sys_memory;
+"@
+
+            # Section B: SQL Server internal memory usage
+            $memSqlQ = @"
+SELECT
+    CAST(physical_memory_in_use_kb    / 1048576.0 AS DECIMAL(10,2)) AS [SQL_Working_Set_GB],
+    CAST(page_fault_count             AS BIGINT)                     AS [Page_Faults],
+    CAST(memory_utilization_percentage AS INT)                       AS [Memory_Util_Pct],
+    CAST(process_physical_memory_low  AS BIT)                        AS [Physical_Mem_Low],
+    CAST(process_virtual_memory_low   AS BIT)                        AS [Virtual_Mem_Low]
+FROM sys.dm_os_process_memory;
+"@
+
+            # Section C: Buffer pool & plan cache summary
+            $memBufferQ = @"
+SELECT
+    CAST(bpool_committed      * 8.0 / 1048576 AS DECIMAL(10,2)) AS [Buffer_Pool_Committed_GB],
+    CAST(bpool_commit_target  * 8.0 / 1048576 AS DECIMAL(10,2)) AS [Buffer_Pool_Target_GB],
+    CAST(bpool_visible        * 8.0 / 1048576 AS DECIMAL(10,2)) AS [Buffer_Pool_Visible_GB],
+    CAST(stolen_page_count    * 8.0 / 1048576 AS DECIMAL(10,2)) AS [Stolen_Pages_GB],
+    CAST(free_page_count      * 8.0 / 1048576 AS DECIMAL(10,2)) AS [Free_Pages_GB]
+FROM sys.dm_os_sys_info;
+"@
+
+            # Section D: Top 15 memory clerks
+            $memClerksQ = @"
+SELECT TOP 15
+    type                                                          AS [Clerk_Type],
+    name                                                          AS [Clerk_Name],
+    CAST(pages_kb / 1048576.0 AS DECIMAL(10,3))                   AS [Allocated_GB],
+    CAST(pages_kb * 100.0 /
+         NULLIF(SUM(pages_kb) OVER(), 0) AS DECIMAL(6,2))         AS [Pct_of_Total]
+FROM sys.dm_os_memory_clerks
+WHERE pages_kb > 0
+ORDER BY pages_kb DESC;
+"@
+
+            # Section E: Top 15 memory-consuming queries right now
+            $memQueryQ = @"
+SELECT TOP 15
+    s.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    DB_NAME(r.database_id)                          AS database_name,
+    r.status,
+    r.total_elapsed_time / 1000                     AS elapsed_sec,
+    -- granted_query_memory is in 8KB pages
+    CAST(r.granted_query_memory * 8.0 / 1024 AS DECIMAL(10,2))  AS [Granted_Mem_MB],
+    r.reads,
+    r.writes,
+    SUBSTRING(t.text, 1, 250)                       AS sql_text
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.granted_query_memory > 0
+  AND s.session_id <> @@SPID
+ORDER BY r.granted_query_memory DESC;
+"@
+
+            # Section F: Memory grants pending & waiting
+            $memGrantQ = @"
+SELECT
+    (SELECT COUNT(*) FROM sys.dm_exec_query_memory_grants WHERE grant_time IS NULL)     AS [Pending_Grants],
+    (SELECT COUNT(*) FROM sys.dm_exec_query_memory_grants WHERE grant_time IS NOT NULL) AS [Active_Grants],
+    CAST(ISNULL(SUM(requested_memory_kb),0) / 1048576.0 AS DECIMAL(10,2))              AS [Total_Requested_GB],
+    CAST(ISNULL(SUM(granted_memory_kb),0)   / 1048576.0 AS DECIMAL(10,2))              AS [Total_Granted_GB],
+    CAST(ISNULL(SUM(used_memory_kb),0)      / 1048576.0 AS DECIMAL(10,2))              AS [Total_Used_GB],
+    CAST(ISNULL(SUM(max_used_memory_kb),0)  / 1048576.0 AS DECIMAL(10,2))              AS [Total_MaxUsed_GB]
+FROM sys.dm_exec_query_memory_grants;
+"@
+
+            try {
+                # --- A: OS Memory Overview ---
+                Write-Host ""
+                Write-Host "  [A] Physical & Virtual Memory Overview" -ForegroundColor White
+                Write-Host ""
+                $mo = (Invoke-SqlQuery -ServerInstance $ServerInstance -Username $Username -SecurePassword $SecurePassword -Query $memOverviewQ).Rows[0]
+
+                $avPct  = [double]$mo['Available_Pct']
+                $avColor = if ($avPct -lt 10) { "Red" } elseif ($avPct -lt 20) { "Yellow" } else { "Green" }
+
+                Write-Host ("  Total Physical Memory  : {0,8} GB" -f $mo['Total_Physical_GB'])     -ForegroundColor White
+                Write-Host ("  Used  Physical Memory  : {0,8} GB" -f $mo['Used_Physical_GB'])      -ForegroundColor White
+                Write-Host ("  Avail Physical Memory  : {0,8} GB  ({1}%)  {2}" -f `
+                    $mo['Available_Physical_GB'], $mo['Available_Pct'], (Draw-Bar $avPct 30))       -ForegroundColor $avColor
+                Write-Host ("  Memory State           : {0}" -f $mo['Memory_State'])               -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host ("  Total Virtual Memory   : {0,8} GB" -f $mo['Total_Virtual_GB'])      -ForegroundColor Gray
+                Write-Host ("  Avail Virtual Memory   : {0,8} GB" -f $mo['Available_Virtual_GB'])  -ForegroundColor Gray
+                Write-Host ("  Total Page File        : {0,8} GB" -f $mo['Total_PageFile_GB'])     -ForegroundColor Gray
+                Write-Host ("  Avail Page File        : {0,8} GB" -f $mo['Available_PageFile_GB']) -ForegroundColor Gray
+
+                # --- B: SQL Process Memory ---
+                Write-Host ""
+                Write-Host "  [B] SQL Server Process Memory" -ForegroundColor White
+                Write-Host ""
+                $mp = (Invoke-SqlQuery -ServerInstance $ServerInstance -Username $Username -SecurePassword $SecurePassword -Query $memSqlQ).Rows[0]
+
+                $muPct  = [int]$mp['Memory_Util_Pct']
+                $muColor = if ($muPct -gt 90) { "Red" } elseif ($muPct -gt 75) { "Yellow" } else { "Green" }
+
+                Write-Host ("  SQL Working Set        : {0,8} GB" -f $mp['SQL_Working_Set_GB'])                        -ForegroundColor White
+                Write-Host ("  Memory Utilization     : {0,8} %   {1}" -f $muPct, (Draw-Bar $muPct 30))                -ForegroundColor $muColor
+                Write-Host ("  Page Faults            : {0,8}"    -f $mp['Page_Faults'])                               -ForegroundColor Gray
+                Write-Host ("  Physical Memory Low    : {0}"       -f $(if ([int]$mp['Physical_Mem_Low'] -eq 1) { "YES - WARNING" } else { "No" })) `
+                    -ForegroundColor $(if ([int]$mp['Physical_Mem_Low'] -eq 1) { "Red" } else { "Green" })
+                Write-Host ("  Virtual Memory Low     : {0}"       -f $(if ([int]$mp['Virtual_Mem_Low'] -eq 1) { "YES - WARNING" } else { "No" })) `
+                    -ForegroundColor $(if ([int]$mp['Virtual_Mem_Low'] -eq 1) { "Red" } else { "Green" })
+
+                # --- C: Buffer Pool ---
+                Write-Host ""
+                Write-Host "  [C] Buffer Pool & Page Cache" -ForegroundColor White
+                Write-Host ""
+                $mb = (Invoke-SqlQuery -ServerInstance $ServerInstance -Username $Username -SecurePassword $SecurePassword -Query $memBufferQ).Rows[0]
+
+                Write-Host ("  Buffer Pool Committed  : {0,8} GB" -f $mb['Buffer_Pool_Committed_GB']) -ForegroundColor Cyan
+                Write-Host ("  Buffer Pool Target     : {0,8} GB" -f $mb['Buffer_Pool_Target_GB'])    -ForegroundColor Cyan
+                Write-Host ("  Buffer Pool Visible    : {0,8} GB" -f $mb['Buffer_Pool_Visible_GB'])   -ForegroundColor Gray
+                Write-Host ("  Stolen Pages           : {0,8} GB" -f $mb['Stolen_Pages_GB'])          -ForegroundColor Gray
+                Write-Host ("  Free Pages             : {0,8} GB" -f $mb['Free_Pages_GB'])            -ForegroundColor Gray
+
+                # --- D: Memory Clerks ---
+                Write-Host ""
+                Write-Host "  [D] Top 15 Memory Clerks (by allocation):" -ForegroundColor White
+                Write-Host ""
+                $clerks = Invoke-SqlQuery -ServerInstance $ServerInstance -Username $Username -SecurePassword $SecurePassword -Query $memClerksQ
+
+                Write-Host ("  {0,-40}  {1,-30}  {2,12}  {3,8}" -f "Clerk Type","Clerk Name","Allocated GB","% of Total") -ForegroundColor White
+                Write-Host ("  {0,-40}  {1,-30}  {2,12}  {3,8}" -f ("-"*40),("-"*30),("-"*12),("-"*8)) -ForegroundColor DarkGray
+
+                foreach ($row in $clerks.Rows) {
+                    $pct = [double]$row['Pct_of_Total']
+                    $clr = if ($pct -gt 40) { "Red" } elseif ($pct -gt 20) { "Yellow" } else { "Cyan" }
+                    Write-Host ("  {0,-40}  {1,-30}  {2,12}  {3,8}" -f `
+                        $row['Clerk_Type'], $row['Clerk_Name'], $row['Allocated_GB'], $row['Pct_of_Total']) -ForegroundColor $clr
+                }
+
+                # --- E: Memory Grants Summary ---
+                Write-Host ""
+                Write-Host "  [E] Memory Grants Summary:" -ForegroundColor White
+                Write-Host ""
+                $mg = (Invoke-SqlQuery -ServerInstance $ServerInstance -Username $Username -SecurePassword $SecurePassword -Query $memGrantQ).Rows[0]
+
+                $pendColor = if ([int]$mg['Pending_Grants'] -gt 0) { "Red" } else { "Green" }
+                Write-Host ("  Pending Grants (waiting): {0}"   -f $mg['Pending_Grants'])    -ForegroundColor $pendColor
+                Write-Host ("  Active  Grants          : {0}"   -f $mg['Active_Grants'])     -ForegroundColor Cyan
+                Write-Host ("  Total Requested         : {0} GB" -f $mg['Total_Requested_GB']) -ForegroundColor Gray
+                Write-Host ("  Total Granted           : {0} GB" -f $mg['Total_Granted_GB'])   -ForegroundColor Gray
+                Write-Host ("  Total Used              : {0} GB" -f $mg['Total_Used_GB'])      -ForegroundColor Gray
+                Write-Host ("  Total Max Used          : {0} GB" -f $mg['Total_MaxUsed_GB'])   -ForegroundColor Gray
+
+                # --- F: Top memory-consuming queries ---
+                Write-Host ""
+                Write-Host "  [F] Top 15 Memory-Consuming Queries (ordered by granted memory):" -ForegroundColor White
+                Write-Host ""
+                $mq = Invoke-SqlQuery -ServerInstance $ServerInstance -Username $Username -SecurePassword $SecurePassword -Query $memQueryQ
+
+                if ($mq.Rows.Count -eq 0) {
+                    Write-Host "  No queries with active memory grants at this moment." -ForegroundColor Green
+                }
+                else {
+                    foreach ($row in $mq.Rows) {
+                        $gm  = [double]$row['Granted_Mem_MB']
+                        $gmc = if ($gm -gt 1024) { "Red" } elseif ($gm -gt 256) { "Yellow" } else { "Cyan" }
+                        Write-Host ("  SPID {0,-6} Granted: {1,8} MB  Elapsed: {2,6}s  [{3}]  Login: {4}  DB: {5}" -f `
+                            $row['session_id'], $row['Granted_Mem_MB'], $row['elapsed_sec'],
+                            $row['status'], $row['login_name'], $row['database_name']) -ForegroundColor $gmc
+                        Write-Host "    Host   : $($row['host_name'])   App: $($row['program_name'])" -ForegroundColor Gray
+                        Write-Host "    SQL    : $(($row['sql_text'] -replace '\s+',' ').Trim())"     -ForegroundColor Gray
+                        Write-Host ""
+                    }
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Option 7 : Backup History
+        # ------------------------------------------------------------
+        "7" {
+            Write-SectionHeader "Backup History - Last Backup per Database"
+
+            # Section A: Latest backup of each type per database
+            $backupLastQ = @"
+SELECT
+    d.name                                                  AS [Database],
+    d.recovery_model_desc                                   AS [Recovery_Model],
+    -- FULL
+    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END) AS [Last_Full],
+    MAX(CASE WHEN bs.type = 'D' THEN CAST(bs.backup_size / 1073741824.0 AS DECIMAL(10,2)) END) AS [Full_Size_GB],
+    MAX(CASE WHEN bs.type = 'D' THEN bs.media_family_count END) AS [Full_Files],
+    -- DIFFERENTIAL
+    MAX(CASE WHEN bs.type = 'I' THEN bs.backup_finish_date END) AS [Last_Diff],
+    MAX(CASE WHEN bs.type = 'I' THEN CAST(bs.backup_size / 1073741824.0 AS DECIMAL(10,2)) END) AS [Diff_Size_GB],
+    -- LOG
+    MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date END) AS [Last_Log],
+    MAX(CASE WHEN bs.type = 'L' THEN CAST(bs.backup_size / 1073741824.0 AS DECIMAL(10,2)) END) AS [Log_Size_GB],
+    -- Hours since last full
+    CAST(DATEDIFF(MINUTE,
+        MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END),
+        GETDATE()) / 60.0 AS DECIMAL(8,1))                  AS [Hours_Since_Full],
+    -- Hours since last log
+    CAST(DATEDIFF(MINUTE,
+        MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date END),
+        GETDATE()) / 60.0 AS DECIMAL(8,1))                  AS [Hours_Since_Log]
+FROM sys.databases d
+LEFT JOIN msdb.dbo.backupset bs ON d.name = bs.database_name
+WHERE d.database_id > 4      -- exclude system databases; remove this line to include them
+  AND d.state = 0
+GROUP BY d.name, d.recovery_model_desc
+ORDER BY [Hours_Since_Full] DESC;
+"@
+
+            # Section B: Last 50 backup jobs with duration & speed
+            $backupDetailQ = @"
+SELECT TOP 50
+    bs.database_name                                        AS [Database],
+    CASE bs.type
+        WHEN 'D' THEN 'FULL'
+        WHEN 'I' THEN 'DIFFERENTIAL'
+        WHEN 'L' THEN 'LOG'
+        WHEN 'F' THEN 'FILE'
+        WHEN 'G' THEN 'FILE DIFF'
+        WHEN 'P' THEN 'PARTIAL'
+        WHEN 'Q' THEN 'PARTIAL DIFF'
+        ELSE bs.type
+    END                                                     AS [Backup_Type],
+    bs.backup_start_date                                    AS [Start_Time],
+    bs.backup_finish_date                                   AS [End_Time],
+    CAST(DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date) / 60.0 AS DECIMAL(8,1)) AS [Duration_Min],
+    CAST(bs.backup_size     / 1073741824.0 AS DECIMAL(10,2)) AS [Backup_GB],
+    CAST(bs.compressed_backup_size / 1073741824.0 AS DECIMAL(10,2)) AS [Compressed_GB],
+    CAST(CASE WHEN bs.compressed_backup_size > 0
+         THEN (1 - CAST(bs.compressed_backup_size AS FLOAT) / bs.backup_size) * 100
+         ELSE 0 END AS DECIMAL(5,1))                        AS [Compression_Pct],
+    CAST(bs.backup_size / 1048576.0 /
+         NULLIF(DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date), 0)
+         AS DECIMAL(10,1))                                  AS [Throughput_MB_s],
+    bs.server_name                                          AS [Server],
+    bs.user_name                                            AS [Taken_By],
+    bmf.physical_device_name                                AS [Backup_File]
+FROM msdb.dbo.backupset bs
+JOIN msdb.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+ORDER BY bs.backup_finish_date DESC;
+"@
+
+            # Section C: Databases with NO backup ever
+            $noBackupQ = @"
+SELECT d.name AS [Database], d.recovery_model_desc AS [Recovery_Model], d.create_date AS [Created]
+FROM sys.databases d
+WHERE d.database_id > 4
+  AND d.state = 0
+  AND d.name NOT IN (SELECT DISTINCT database_name FROM msdb.dbo.backupset)
+ORDER BY d.name;
+"@
+
+            try {
+                # --- A: Summary per database ---
+                Write-Host ""
+                Write-Host "  [A] Last Backup Summary per Database:" -ForegroundColor White
+                Write-Host ""
+                Write-Host ("  {0,-28}  {1,-12}  {2,-20}  {3,8}  {4,-20}  {5,-20}  {6,14}  {7,13}" -f `
+                    "Database","Recovery","Last Full","Full GB","Last Diff","Last Log","Hrs Since Full","Hrs Since Log") -ForegroundColor White
+                Write-Host ("  {0,-28}  {1,-12}  {2,-20}  {3,8}  {4,-20}  {5,-20}  {6,14}  {7,13}" -f `
+                    ("-"*28),("-"*12),("-"*20),("-"*8),("-"*20),("-"*20),("-"*14),("-"*13)) -ForegroundColor DarkGray
+
+                $bkSummary = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                             -Username $Username `
+                                             -SecurePassword $SecurePassword `
+                                             -Query $backupLastQ
+
+                foreach ($row in $bkSummary.Rows) {
+
+                    $hrsFull = if ($row['Hours_Since_Full'] -eq [DBNull]::Value) { 999999 } else { [double]$row['Hours_Since_Full'] }
+                    $hrsLog  = if ($row['Hours_Since_Log']  -eq [DBNull]::Value) { 999999 } else { [double]$row['Hours_Since_Log'] }
+
+                    # Color by how stale the full backup is
+                    $rowColor = if ($hrsFull -gt 168)  { "Red" }      # > 7 days
+                                elseif ($hrsFull -gt 48) { "Yellow" } # > 2 days
+                                else { "Green" }
+
+                    $lastFull = if ($row['Last_Full'] -eq [DBNull]::Value) { "NEVER" } else { $row['Last_Full'] }
+                    $lastDiff = if ($row['Last_Diff'] -eq [DBNull]::Value) { "N/A"   } else { $row['Last_Diff'] }
+                    $lastLog  = if ($row['Last_Log']  -eq [DBNull]::Value) { "N/A"   } else { $row['Last_Log'] }
+                    $fullGB   = if ($row['Full_Size_GB'] -eq [DBNull]::Value) { "-" } else { $row['Full_Size_GB'] }
+                    $hrsFullD = if ($hrsFull -eq 999999) { "NEVER" } else { $row['Hours_Since_Full'] }
+                    $hrsLogD  = if ($hrsLog  -eq 999999) { "NEVER" } else { $row['Hours_Since_Log'] }
+
+                    Write-Host ("  {0,-28}  {1,-12}  {2,-20}  {3,8}  {4,-20}  {5,-20}  {6,14}  {7,13}" -f `
+                        $row['Database'], $row['Recovery_Model'], $lastFull, $fullGB,
+                        $lastDiff, $lastLog, $hrsFullD, $hrsLogD) -ForegroundColor $rowColor
+                }
+
+                Write-Host ""
+                Write-Host "  Full backup color key: " -NoNewline
+                Write-Host "Green = < 2 days  "   -ForegroundColor Green  -NoNewline
+                Write-Host "Yellow = 2-7 days  "  -ForegroundColor Yellow -NoNewline
+                Write-Host "Red = > 7 days or NEVER" -ForegroundColor Red
+
+                # --- B: Recent backup history detail ---
+                Write-Host ""
+                Write-Host "  [B] Last 50 Backup Jobs (newest first):" -ForegroundColor White
+                Write-Host ""
+
+                $bkDetail = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                            -Username $Username `
+                                            -SecurePassword $SecurePassword `
+                                            -Query $backupDetailQ
+
+                if ($bkDetail.Rows.Count -eq 0) {
+                    Write-Host "  No backup history found in msdb." -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host ("  {0,-25}  {1,-14}  {2,-20}  {3,8}  {4,7}  {5,7}  {6,7}  {7,12}  {8}" -f `
+                        "Database","Type","End Time","Dur(min)","Bkp GB","Cmp GB","Cmp%","Thput MB/s","Backup File") -ForegroundColor White
+                    Write-Host ("  {0,-25}  {1,-14}  {2,-20}  {3,8}  {4,7}  {5,7}  {6,7}  {7,12}  {8}" -f `
+                        ("-"*25),("-"*14),("-"*20),("-"*8),("-"*7),("-"*7),("-"*7),("-"*12),("-"*30)) -ForegroundColor DarkGray
+
+                    foreach ($row in $bkDetail.Rows) {
+                        $typeColor = switch ($row['Backup_Type']) {
+                            "FULL"         { "Cyan" }
+                            "DIFFERENTIAL" { "Yellow" }
+                            "LOG"          { "Gray" }
+                            default        { "White" }
+                        }
+                        $file = if ($row['Backup_File'].Length -gt 40) { "..." + $row['Backup_File'].Substring($row['Backup_File'].Length - 37) } else { $row['Backup_File'] }
+                        Write-Host ("  {0,-25}  {1,-14}  {2,-20}  {3,8}  {4,7}  {5,7}  {6,7}  {7,12}  {8}" -f `
+                            $row['Database'], $row['Backup_Type'], $row['End_Time'],
+                            $row['Duration_Min'], $row['Backup_GB'], $row['Compressed_GB'],
+                            $row['Compression_Pct'], $row['Throughput_MB_s'], $file) -ForegroundColor $typeColor
+                    }
+                }
+
+                # --- C: Databases never backed up ---
+                Write-Host ""
+                Write-Host "  [C] Databases with NO backup ever:" -ForegroundColor White
+                Write-Host ""
+
+                $noBk = Invoke-SqlQuery -ServerInstance $ServerInstance `
+                                        -Username $Username `
+                                        -SecurePassword $SecurePassword `
+                                        -Query $noBackupQ
+
+                if ($noBk.Rows.Count -eq 0) {
+                    Write-Host "  All user databases have at least one backup." -ForegroundColor Green
+                }
+                else {
+                    Write-Host "  *** WARNING: The following databases have NEVER been backed up! ***" -ForegroundColor Red
+                    Write-Host ""
+                    foreach ($row in $noBk.Rows) {
+                        Write-Host ("  Database: {0,-30}  Recovery: {1,-12}  Created: {2}" -f `
+                            $row['Database'], $row['Recovery_Model'], $row['Created']) -ForegroundColor Red
+                    }
+                }
+            }
+            catch {
+                Write-Host "  [ERROR] $_" -ForegroundColor Red
+            }
+        }
+
+        # ------------------------------------------------------------
+        # Quit
+        # ------------------------------------------------------------
+        "Q" {
+            Write-Host ""
+            Write-Host "  Exiting DBA Diagnostics Tool. Goodbye!" -ForegroundColor Cyan
+            Write-Host ""
+            break MainLoop
+        }
+
+        default {
+            Write-Host ""
+            Write-Host "  Invalid option. Please enter 1-7 or Q." -ForegroundColor Red
+        }
+    }
+
+    Write-Host ""
+    Read-Host "  Press Enter to return to the menu"
+}
+
+#endregion

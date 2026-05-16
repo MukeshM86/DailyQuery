@@ -1,0 +1,250 @@
+================================================================================
+FILE 3: MEASURE SP CPU USAGE AS % OF TOTAL SERVER CPU ACROSS ALL SESSIONS
+================================================================================
+PROBLEM STATEMENT:
+  The SP is running across multiple concurrent sessions (batch calls).
+  These queries calculate exactly what % of the total server CPU your SP
+  is consuming -- giving hard evidence of the impact.
+
+WHEN TO RUN:
+  Run DURING the batch window when the service is actively calling the SP.
+  Results are real-time and change every few seconds.
+
+REFERENCE VALUES TO CHANGE:
+  >> Replace 'YourStoredProcName' with your actual stored procedure name
+     in ALL queries below.
+
+THRESHOLD GUIDANCE:
+  - SP CPU %  > 30%   : SP is a significant consumer -- investigate
+  - SP CPU %  > 60%   : SP is dominating the server -- urgent fix needed
+  - SP CPU %  > 80%   : Critical -- server is almost exclusively serving this SP
+  - Sessions  > 10    : High concurrency -- risk of contention and lock chains
+  - pct_within_sp > 25% per session : One session doing disproportionate work
+
+================================================================================
+QUERY 1: SP TOTAL CPU vs ENTIRE SERVER -- SINGLE SUMMARY ROW
+================================================================================
+PURPOSE : Gives ONE clear number -- what % of total server CPU your SP
+          is consuming across all its concurrent sessions right now.
+          Use this as your PRIMARY confirmation query.
+
+OUTPUT EXAMPLE:
+  sp_active_sessions | sp_total_cpu_ms | server_total_cpu_ms | sp_pct_of_server_cpu
+  18                 | 142000          | 160000              | 88.75
+
+HOW TO INTERPRET:
+  - sp_active_sessions    : Number of sessions currently running this SP
+  - sp_total_cpu_ms       : Combined CPU of all SP sessions (ms)
+  - server_total_cpu_ms   : Total CPU of ALL sessions on the server (ms)
+  - sp_pct_of_server_cpu  : THE KEY NUMBER -- SP's share of server CPU
+                            >> If this is > 80%, SP is your confirmed problem
+
+REPLACE:
+  >> 'YourStoredProcName' with your SP name
+
+--------------------------------------------------------------------------------
+
+;WITH sp_cpu AS (
+    SELECT 
+        SUM(r.cpu_time)     AS sp_total_cpu,
+        COUNT(*)            AS session_count
+    FROM sys.dm_exec_requests r
+    CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) s
+    WHERE s.text LIKE '%YourStoredProcName%'
+),
+server_cpu AS (
+    SELECT SUM(cpu_time)    AS total_server_cpu
+    FROM sys.dm_exec_requests
+)
+SELECT 
+    sp.session_count                                        AS sp_active_sessions,
+    sp.sp_total_cpu                                         AS sp_total_cpu_ms,
+    srv.total_server_cpu                                    AS server_total_cpu_ms,
+    CAST(
+        sp.sp_total_cpu * 100.0 / NULLIF(srv.total_server_cpu, 0)
+        AS DECIMAL(5,2))                                    AS sp_pct_of_server_cpu
+FROM sp_cpu sp, server_cpu srv;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 2: SESSION-BY-SESSION BREAKDOWN WITH DUAL CPU %
+================================================================================
+PURPOSE : Shows each session running your SP with TWO percentage columns:
+          1. Its % share within all SP sessions
+          2. Its % share of total server CPU
+          Use this to find which session is the biggest offender.
+
+COLUMNS TO CHECK:
+  - session_id              : Unique session identifier
+  - cpu_ms                  : CPU consumed by this session so far (ms)
+  - elapsed_ms              : Wall clock time since session started (ms)
+  - logical_reads           : Memory reads -- high = missing index
+  - pct_within_sp_sessions  : This session's % of SP's combined CPU
+                              >> If one session is 60%+ it's an outlier
+  - pct_of_server_cpu       : This session's % of TOTAL server CPU
+  - wait_type               : Current wait -- see reference table below
+  - blocking_session_id     : Non-zero = blocked by another session
+
+WAIT TYPE QUICK REFERENCE:
+  WAIT TYPE              MEANING                        THRESHOLD
+  ---------------------- ------------------------------ ----------------------
+  CXPACKET               Parallelism overhead           Add MAXDOP 1
+  SOS_SCHEDULER_YIELD    CPU maxed out                  Optimize query
+  LCK_M_S / LCK_M_X     Lock contention                Shorten transactions
+  PAGEIOLATCH_SH         Disk IO -- data not in memory   Check buffer pool
+  RESOURCE_SEMAPHORE     Memory grant waiting           Check max server memory
+
+REPLACE:
+  >> 'YourStoredProcName' with your SP name
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    r.session_id,
+    r.status,
+    r.cpu_time                                              AS cpu_ms,
+    r.total_elapsed_time                                    AS elapsed_ms,
+    r.logical_reads,
+    -- % this session contributes to all SP sessions combined
+    CAST(
+        r.cpu_time * 100.0 / 
+        NULLIF(SUM(r.cpu_time) OVER(), 0)
+        AS DECIMAL(5,2))                                    AS pct_within_sp_sessions,
+    -- % this session contributes to total server CPU
+    CAST(
+        r.cpu_time * 100.0 / 
+        NULLIF((SELECT SUM(cpu_time) FROM sys.dm_exec_requests), 0)
+        AS DECIMAL(5,2))                                    AS pct_of_server_cpu,
+    r.wait_type,
+    r.blocking_session_id
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) s
+WHERE s.text LIKE '%YourStoredProcName%'
+ORDER BY r.cpu_time DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 3: HISTORICAL CPU % -- SP VS ALL STORED PROCEDURES SINCE RESTART
+================================================================================
+PURPOSE : Shows your SP's total CPU share compared to ALL stored procedures
+          that have run since SQL Server last restarted.
+          Use this for post-incident analysis and capacity planning.
+
+COLUMNS TO CHECK:
+  - execution_count         : Total times SP was called since restart
+  - total_cpu_ms            : Cumulative CPU consumed (ms)
+  - avg_cpu_per_exec_ms     : Average CPU per single call (ms)
+                              >> > 500ms is concerning for batch usage
+  - pct_of_all_sp_cpu       : SP's share of ALL stored procedure CPU
+                              >> > 50% means this SP dominates all others
+
+THRESHOLD:
+  - avg_cpu_per_exec_ms > 500   : Optimize the query inside SP
+  - avg_cpu_per_exec_ms > 2000  : Critical -- major optimization needed
+  - pct_of_all_sp_cpu > 50%     : This SP dominates the server workload
+
+REPLACE:
+  >> 'YourStoredProcName' with your SP name
+
+--------------------------------------------------------------------------------
+
+SELECT 
+    OBJECT_NAME(ps.object_id)                              AS sp_name,
+    ps.execution_count,
+    ps.total_worker_time / 1000                            AS total_cpu_ms,
+    ps.total_worker_time / ps.execution_count / 1000       AS avg_cpu_per_exec_ms,
+    -- SP's CPU share vs ALL stored procedures combined
+    CAST(
+        ps.total_worker_time * 100.0 /
+        NULLIF((SELECT SUM(total_worker_time) 
+                FROM sys.dm_exec_procedure_stats), 0)
+        AS DECIMAL(5,2))                                    AS pct_of_all_sp_cpu,
+    ps.last_execution_time
+FROM sys.dm_exec_procedure_stats ps
+WHERE OBJECT_NAME(ps.object_id) = 'YourStoredProcName';
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+QUERY 4: TOP 10 CPU-CONSUMING SESSIONS ON THE SERVER (FULL CONTEXT)
+================================================================================
+PURPOSE : Shows top 10 sessions by CPU across the ENTIRE server.
+          Use this to see where your SP's sessions rank among everything else.
+          Helps confirm your SP sessions are dominating the top of the list.
+
+COLUMNS TO CHECK:
+  - cpu_time         : Higher = more CPU used
+  - pct_of_server    : This session's % of total server CPU
+                       >> Your SP sessions should cluster at the top
+  - sql_text         : Confirms which sessions belong to your SP
+
+--------------------------------------------------------------------------------
+
+SELECT TOP 10
+    r.session_id,
+    r.status,
+    r.cpu_time                                              AS cpu_ms,
+    r.logical_reads,
+    CAST(
+        r.cpu_time * 100.0 /
+        NULLIF((SELECT SUM(cpu_time) FROM sys.dm_exec_requests), 0)
+        AS DECIMAL(5,2))                                    AS pct_of_server,
+    r.wait_type,
+    LEFT(s.text, 100)                                       AS sql_text_preview
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) s
+ORDER BY r.cpu_time DESC;
+
+--------------------------------------------------------------------------------
+
+
+================================================================================
+HOW TO PRESENT THESE FINDINGS -- VISUAL BREAKDOWN
+================================================================================
+
+  After running Query 1, you can visualize the result like this:
+
+  Total Server CPU = 100%
+  |
+  +-- YourStoredProcName (N sessions) = XX%   <-- Confirmed problem
+  |       +-- Session AAA  = XX%
+  |       +-- Session BBB  = XX%
+  |       +-- Session CCC  = XX%
+  |       +-- ... remaining sessions
+  |
+  +-- All other queries combined = YY%
+
+================================================================================
+RECOMMENDED EXECUTION ORDER
+================================================================================
+
+  STEP   QUERY     PURPOSE
+  ------ --------- -------------------------------------------------------------
+  1      Query 1   Get SP's total CPU % of server -> confirm it's the problem
+  2      Query 2   Find which individual sessions are worst offenders
+  3      Query 4   Rank SP sessions against all server sessions
+  4      Query 3   Review historical pattern since last restart
+  5      File 1    Pull execution plan -> find WHY it's expensive
+  6      File 2    Measure call frequency -> control batch behavior
+
+================================================================================
+NEXT STEPS AFTER CONFIRMATION
+================================================================================
+
+  FINDING                              ACTION
+  ------------------------------------ ----------------------------------------
+  SP CPU% > 80%                        Immediate query optimization required
+  avg_cpu_per_exec > 500ms             Add covering index / rewrite SELECT
+  Many sessions, low individual CPU    Throttle service call frequency
+  One session with very high CPU       Parameter sniffing -- add OPTION(RECOMPILE)
+  High logical_reads                   Run File 1 -> Query 3 for missing indexes
+  blocking_session_id != 0             Review lock scope inside SP
+
+================================================================================
+END OF FILE 3
+================================================================================
